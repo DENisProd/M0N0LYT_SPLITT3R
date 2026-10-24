@@ -1,0 +1,14 @@
+{
+  "name": "java-blueprints",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "install:all": "pnpm -C server install && pnpm -C client install",
+    "dev": "concurrently -n server,client -c yellow,cyan \"pnpm -C server dev\" \"pnpm -C client dev\"",
+    "typecheck": "pnpm -C server typecheck && pnpm -C client exec tsc --noEmit",
+    "build": "pnpm -C client build"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}

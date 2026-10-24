@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+/// Глобальные настройки инструмента: ключ → JSON-значение.
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+/// Состояние загруженного проекта: входные данные, тест-кейсы классов, выбор распила.
+/// key — отпечаток списка путей файлов: правки кода его не меняют.
+model Project {
+  key           String   @id
+  name          String
+  tests         Json
+  unitCases     Json
+  decomposition Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
