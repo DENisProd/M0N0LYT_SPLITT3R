@@ -47,7 +47,7 @@ export function SettingsDialog({ settings, onSaved, onClose }: Props) {
       <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <button className="inspector-close" onClick={onClose} aria-label="Закрыть"><X size={14} /></button>
         <h2 id="settings-title" className="dialog-title">Настройки</h2>
-        <p className="hint">Сохраняются на сервере в SQLite. Тесты, тест-кейсы и выбор распила сохраняются для каждого проекта автоматически.</p>
+        <p className="hint">Сохраняются на сервере в SQLite. Тесты, тест-кейсы и выбранный вариант микросервисов сохраняются для каждого проекта автоматически.</p>
 
         <div className="inspector-h">Локальная LLM (Ollama)</div>
         <label className="field">

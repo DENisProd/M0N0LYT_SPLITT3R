@@ -2,10 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import cors from 'cors';
 import express from 'express';
-import type { ProjectState, SourceFile, TestCase } from '../../shared/types.ts';
+import type { FixEvent, ProjectState, SourceFile, TestCase } from '../../shared/types.ts';
 import { analyzeProject } from './analyze.ts';
 import { generateCases } from './cases.ts';
 import { decompose } from './decompose.ts';
+import { proposeFixes } from './fixes.ts';
+import { applyPattern } from './patterns.ts';
+import { planSplit, splitClass } from './split.ts';
+import { createCommit, getCommitFiles, getHistory, setHead } from './history.ts';
 import { initParser } from './parser.ts';
 import { checkJava, compareBehavior, compileAndRun } from './runner.ts';
 import { getProject, getSettings, listProjects, saveProject, saveSettings } from './store.ts';
@@ -65,6 +69,66 @@ app.post('/api/decompose', (req, res) => {
   res.json(decompose(files, analyzeProject(files), typeof appId === 'string' ? appId : null));
 });
 
+app.post('/api/fix', async (req, res) => {
+  const { files, ids, llm, tests, unitCases } = req.body ?? {};
+  if (!isFiles(files)) return void res.status(400).json({ error: 'files: SourceFile[] required' });
+  const wanted = Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : undefined;
+  // Генерация идёт минутами: ход работы уходит клиенту построчно (NDJSON), закрытие соединения её отменяет.
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const controller = new AbortController();
+  res.on('close', () => !res.writableFinished && controller.abort());
+  const send = (e: FixEvent) => res.write(JSON.stringify(e) + '\n');
+  try {
+    const result = await proposeFixes(
+      { files, ids: wanted, llm: !!llm, tests: Array.isArray(tests) ? tests : [], unitCases: Array.isArray(unitCases) ? unitCases : [] },
+      { onProgress: (progress) => send({ type: 'progress', progress }), signal: controller.signal },
+    );
+    send({ type: 'result', result });
+  } catch (e) {
+    if (!controller.signal.aborted) send({ type: 'error', error: e instanceof Error ? e.message : String(e) });
+  }
+  res.end();
+});
+
+app.post('/api/split/plan', (req, res) => {
+  const { files, file, typeName, parts } = req.body ?? {};
+  if (!isFiles(files) || typeof file !== 'string' || typeof typeName !== 'string') return void res.status(400).json({ error: 'files, file, typeName required' });
+  res.json(planSplit(files, file, typeName, typeof parts === 'number' ? parts : undefined));
+});
+
+app.post('/api/split/apply', async (req, res) => {
+  const { files, plan, tests, unitCases } = req.body ?? {};
+  if (!isFiles(files) || !plan || !Array.isArray(plan.parts)) return void res.status(400).json({ error: 'files, plan required' });
+  try {
+    res.json(await splitClass({ files, plan, tests: Array.isArray(tests) ? tests : [], unitCases: Array.isArray(unitCases) ? unitCases : [] }));
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post('/api/patterns/apply', async (req, res) => {
+  const { files, findingId, tests, unitCases } = req.body ?? {};
+  if (!isFiles(files) || typeof findingId !== 'string') return void res.status(400).json({ error: 'files, findingId required' });
+  res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.flushHeaders();
+  const controller = new AbortController();
+  res.on('close', () => !res.writableFinished && controller.abort());
+  const send = (e: FixEvent) => res.write(JSON.stringify(e) + '\n');
+  try {
+    const result = await applyPattern(
+      { files, findingId, tests: Array.isArray(tests) ? tests : [], unitCases: Array.isArray(unitCases) ? unitCases : [] },
+      { onProgress: (progress) => send({ type: 'progress', progress }), signal: controller.signal },
+    );
+    send({ type: 'result', result });
+  } catch (e) {
+    if (!controller.signal.aborted) send({ type: 'error', error: e instanceof Error ? e.message : String(e) });
+  }
+  res.end();
+});
+
 app.get('/api/settings', async (_req, res) => {
   res.json(await getSettings());
 });
@@ -110,9 +174,32 @@ app.put('/api/projects/:key', async (req, res) => {
   res.json({ updatedAt });
 });
 
+app.get('/api/projects/:key/history', async (req, res) => {
+  res.json(await getHistory(req.params.key));
+});
+
+app.get('/api/projects/:key/commits/:id', async (req, res) => {
+  const files = await getCommitFiles(req.params.key, req.params.id);
+  if (!files) return void res.status(404).json({ error: 'commit not found' });
+  res.json({ files });
+});
+
+app.post('/api/projects/:key/commits', async (req, res) => {
+  const { message, files, parentId } = req.body ?? {};
+  if (!isFiles(files) || typeof message !== 'string' || !message.trim()) return void res.status(400).json({ error: 'message, files required' });
+  const commit = await createCommit(req.params.key, message.trim(), files, typeof parentId === 'string' ? parentId : null);
+  res.json({ commit, history: await getHistory(req.params.key) });
+});
+
+app.put('/api/projects/:key/head', async (req, res) => {
+  const { id } = req.body ?? {};
+  if (typeof id !== 'string' || !(await setHead(req.params.key, id))) return void res.status(404).json({ error: 'commit not found' });
+  res.json(await getHistory(req.params.key));
+});
+
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(err);
   res.status(500).json({ error: err.message });
 });
 
-app.listen(PORT, () => console.log(`Java Blueprints server: http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Dark Secrets server: http://localhost:${PORT}`));

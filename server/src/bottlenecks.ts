@@ -2,7 +2,7 @@ import type { AnalyzeResult, Bottleneck, BottleneckEvidence, DecompositionType, 
 import { plural } from './analyzer.ts';
 
 // Узкие места монолита. Два вида:
-// — структурные: мешают распилу (god-классы, центральные зависимости, общие таблицы, циклы, транзакции через агрегаты);
+// — структурные: мешают разделению на сервисы (god-классы, центральные зависимости, общие таблицы, циклы, транзакции через агрегаты);
 // — нагрузочные: эндпоинты, на пути которых найдены запросы в цикле, сетевые вызовы в транзакции и т. п.
 
 export interface BottleneckInput {
@@ -239,8 +239,8 @@ export function findBottlenecks(input: BottleneckInput): { bottlenecks: Bottlene
       kind: 'god-class',
       severity: depDomains.length >= 5 || (lines >= 500 && depDomains.length >= 3) ? 'high' : 'medium',
       title: `God-класс ${t.name}`,
-      message: `${plural(lines, 'строка', 'строки', 'строк')}, ${plural(methodCount, 'метод', 'метода', 'методов')}, работает с ${plural(depDomains.length, 'доменом', 'доменами', 'доменами')}: ${list(depDomains, 6)}${technical ? ` и ещё ${plural(technical, 'технической зависимостью', 'техническими зависимостями', 'техническими зависимостями')}` : ''}. Его меняют по любому поводу, а при распиле класс некуда положить целиком.`,
-      recommendation: 'Разделите по доменам: методы, работающие с одним доменом, — в отдельный класс рядом с ним. Тогда при распиле каждая часть уйдёт в свой сервис.',
+      message: `${plural(lines, 'строка', 'строки', 'строк')}, ${plural(methodCount, 'метод', 'метода', 'методов')}, работает с ${plural(depDomains.length, 'доменом', 'доменами', 'доменами')}: ${list(depDomains, 6)}${technical ? ` и ещё ${plural(technical, 'технической зависимостью', 'техническими зависимостями', 'техническими зависимостями')}` : ''}. Его меняют по любому поводу, а при разделении на сервисы класс некуда положить целиком.`,
+      recommendation: 'Разделите по доменам: методы, работающие с одним доменом, — в отдельный класс рядом с ним. Тогда при разделении на сервисы каждая часть уйдёт в свой сервис.',
       types: [k],
       evidence: [...byStem].sort((a, b) => b[1].size - a[1].size).map(([s, ms]) => ({
         text: `${s}: ${list([...new Set([...ms].map((id) => methods.get(id)?.name ?? id))], 5)}`,
@@ -263,7 +263,7 @@ export function findBottlenecks(input: BottleneckInput): { bottlenecks: Bottlene
       kind: 'hub',
       severity: stems.size >= 5 ? 'high' : 'medium',
       title: `Центральная зависимость ${t.name}`,
-      message: `${t.name} используют ${plural(from.length, 'класс', 'класса', 'классов')} из ${plural(stems.size, 'модуля', 'модулей', 'модулей')} (${list([...stems], 6)}). После распила каждый из них будет ходить к нему по сети: общая точка отказа и узкое место по нагрузке.`,
+      message: `${t.name} используют ${plural(from.length, 'класс', 'класса', 'классов')} из ${plural(stems.size, 'модуля', 'модулей', 'модулей')} (${list([...stems], 6)}). После разделения на сервисы каждый из них будет ходить к нему по сети: общая точка отказа и узкое место по нагрузке.`,
       recommendation: stateless
         ? 'У класса нет состояния — вынесите его в общую библиотеку, которую подключит каждый сервис.'
         : 'Разделите обязанности по потребителям или выделите отдельный сервис с узким API и кэшем на стороне клиентов.',
@@ -296,7 +296,7 @@ export function findBottlenecks(input: BottleneckInput): { bottlenecks: Bottlene
       kind: 'shared-data',
       severity: byStem.size >= 4 ? 'high' : 'medium',
       title: `Общие данные ${aggregateName(root)}`,
-      message: `С таблицами агрегата ${aggregateName(root)}${ents.length > 1 ? ` (${list(ents.map(name))})` : ''} работают ${plural(byStem.size, 'чужой домен', 'чужих домена', 'чужих доменов')}: ${list([...byStem.keys()], 6)}. При распиле это общая БД или синхронизация данных между сервисами.`,
+      message: `С таблицами агрегата ${aggregateName(root)}${ents.length > 1 ? ` (${list(ents.map(name))})` : ''} работают ${plural(byStem.size, 'чужой домен', 'чужих домена', 'чужих доменов')}: ${list([...byStem.keys()], 6)}. При разделении на сервисы это общая БД или синхронизация данных между сервисами.`,
       recommendation: `Назначьте ${aggregateName(root)} одного владельца. Остальные получают данные через его API или события и хранят у себя только нужные поля.`,
       types: [...inside, ...[...byStem.values()].flatMap((s) => [...s])],
       evidence: [...byStem].map(([s, us]) => {
@@ -334,7 +334,7 @@ export function findBottlenecks(input: BottleneckInput): { bottlenecks: Bottlene
     });
   }
 
-  // --- Транзакции через агрегаты: после распила по данным — распределённая транзакция ---
+  // --- Транзакции через агрегаты: после разделения данных — распределённая транзакция ---
   const transactions: TransactionSpan[] = [];
   for (const [k, t] of infos) {
     const src = sources.get(t.file) ?? '';
@@ -392,7 +392,7 @@ export function findBottlenecks(input: BottleneckInput): { bottlenecks: Bottlene
       message: `На пути запроса ${plural(reached.size, 'метод', 'метода', 'методов')} в ${plural(classes.length, 'классе', 'классах', 'классах')}: ${summary.join('; ')}. Время ответа растёт с объёмом данных.`,
       recommendation: high.length
         ? 'Исправьте запросы в цикле на пути эндпоинта — это главный кандидат на деградацию под нагрузкой. Подробности — в списке проблем на вкладке «Методы».'
-        : 'Проверьте профилем под нагрузкой; при распиле этот эндпоинт будет собирать данные из нескольких сервисов — подумайте о проекции (CQRS) или кэше.',
+        : 'Проверьте профилем под нагрузкой; после разделения на сервисы этот эндпоинт будет собирать данные из нескольких сервисов — подумайте о проекции (CQRS) или кэше.',
       types: classes.filter((c) => types.has(c)),
       evidence: [
         ...diags.map((d) => ({ text: `${d.title} — ${methodType.get(d.methodId!)?.label ?? d.methodId}:${d.range.startLine}`, range: d.range })),

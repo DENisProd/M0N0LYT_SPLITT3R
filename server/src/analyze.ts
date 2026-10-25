@@ -2,7 +2,9 @@ import type { AnalyzeResult, FlowGraph, SourceFile } from '../../shared/types.ts
 import { analyze } from './analyzer.ts';
 import { buildFlow } from './cfg.ts';
 import { buildCallGraph, extractModel, type ExtractedModel, type MethodNode } from './model.ts';
+import { findDataStores } from './datastores.ts';
 import { collectErrors, parseJava } from './parser.ts';
+import { findPatterns } from './patterns.ts';
 import { perfDiagnostics } from './perf.ts';
 import { scopeFindings } from './scope.ts';
 import { buildArchitecture, callScope } from './services.ts';
@@ -10,8 +12,8 @@ import { buildArchitecture, callScope } from './services.ts';
 export function analyzeProject(all: SourceFile[]): AnalyzeResult {
   const files = all.filter((f) => f.path.endsWith('.java')); // pom.xml нужен только сборке
   const result: AnalyzeResult = {
-    architecture: { apps: [], externals: [], links: [] },
-    types: [], callGraph: [], flows: {}, diagnostics: [], metrics: [], parseErrors: [], scope: [],
+    architecture: { apps: [], externals: [], links: [], stores: [], access: [] },
+    types: [], callGraph: [], flows: {}, diagnostics: [], metrics: [], parseErrors: [], scope: [], patterns: [],
   };
   const methods: MethodNode[] = [];
   const trees = files.map((f) => parseJava(f.content));
@@ -39,11 +41,14 @@ export function analyzeProject(all: SourceFile[]): AnalyzeResult {
     result.flows[m.info.id] = flow;
   }
   result.architecture = buildArchitecture(files, trees, result.types);
+  findDataStores(all, files, trees, result.types, result.architecture);
   result.callGraph = buildCallGraph(result.types, callScope(result.architecture));
   const ownTypes = new Set(result.types.map((t) => t.name.split('.').pop()!));
   trees.forEach((t, i) => result.scope.push(...scopeFindings(t.rootNode, files[i].path, ownTypes)));
   Object.assign(result, analyze(methods, result.types));
   result.diagnostics.push(...perfDiagnostics(methods, result.types, sources).map((d, i) => ({ id: `p${i}`, ...d })));
+
+  result.patterns = findPatterns(files, trees, result.types);
 
   for (const t of trees) t.delete(); // wasm-память освобождаем вручную
   return result;

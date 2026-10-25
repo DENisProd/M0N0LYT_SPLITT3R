@@ -25,3 +25,32 @@ model Project {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 }
+
+/// Содержимое файла по sha1, как blob в git: коммиты делят неизменённые файлы.
+model Blob {
+  hash    String @id
+  content String
+}
+
+/// Версия проекта. files — [{ path, blob }] в порядке файлов проекта.
+model Commit {
+  id         String   @id
+  projectKey String
+  parentId   String?
+  message    String
+  files      Json
+  /// Изменённых файлов относительно родителя.
+  changed    Int
+  createdAt  DateTime @default(now())
+
+  @@index([projectKey])
+}
+
+/// Ссылки на коммиты, как refs в git; сейчас используется только HEAD.
+model Ref {
+  projectKey String
+  name       String
+  commitId   String
+
+  @@id([projectKey, name])
+}

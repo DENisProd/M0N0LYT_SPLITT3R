@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactElement } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactElement } from 'react';
 import {
   ChevronRight,
   CircleCheck,
   CircleX,
   Download,
   FileCode,
+  FileDiff,
   Boxes,
   FlaskConical,
   FolderOpen,
@@ -14,8 +15,10 @@ import {
   Lambda,
   LayoutGrid,
   LoaderCircle,
-  Pin,
+  PanelBottom,
+  PanelRight,
   Play,
+  Blocks,
   Scissors,
   Settings,
   Trash2,
@@ -28,20 +31,28 @@ import type {
   DecompositionChoice,
   CompareResult,
   Diagnostic,
+  FixProgress,
+  FixResult,
   FlowNode,
+  History,
   MethodInfo,
+  PatternFinding,
   Range,
   ScopeCategory,
   ScopeFinding,
   Severity,
   SourceFile,
+  SplitPlan,
+  SplitResult,
   TestCase,
   TypeInfo,
   UnitCase,
 } from '../../shared/types.ts';
 import { api } from './api.ts';
-import { projectKey, readJavaFiles } from './project.ts';
+import { projectKey, readJavaFiles, type ProjectSource } from './project.ts';
+import { exportProject } from './exportZip.ts';
 import { BLOCKS, deleteRange, insertAfter, insertAtBodyStart, replaceRange } from './edits.ts';
+import { changedFiles } from '../../shared/diff.ts';
 import { KIND } from './theme.ts';
 import { AnalysisPanel } from './components/AnalysisPanel.tsx';
 import { AppsView } from './components/AppsView.tsx';
@@ -51,6 +62,10 @@ import { ClassView } from './components/ClassView.tsx';
 import { CasesPanel, type CasesTarget } from './components/CasesPanel.tsx';
 import { CodeEditor } from './components/CodeEditor.tsx';
 import { DecomposeView } from './components/DecomposeView.tsx';
+import { HistoryPanel } from './components/HistoryPanel.tsx';
+import { ReviewView, type Review } from './components/ReviewView.tsx';
+import { Elapsed, FixProgressView, type FixRun } from './components/FixProgressView.tsx';
+import { SplitView, type SplitTarget } from './components/SplitView.tsx';
 import { SettingsDialog } from './components/SettingsDialog.tsx';
 import { FlowView } from './components/FlowView.tsx';
 
@@ -67,16 +82,34 @@ const DEFAULT_TESTS: TestCase[] = [
 
 type JavaStatus = { state: 'checking' } | { state: 'ok'; version: string } | { state: 'missing' } | { state: 'offline' };
 
+const BOTTOM_MIN = 120;
+const CANVAS_MIN = 160;
+const TOOLBAR_H = 52;
+
+/** Состояние раскладки, которое переживает перезагрузку страницы. */
+function useStored<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw === null ? initial : (JSON.parse(raw) as T);
+    } catch {
+      return initial;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      // хранилище недоступно — раскладка просто не запомнится
+    }
+  }, [key, value]);
+  return [value, setValue] as const;
+}
+
 const now = () => new Date().toLocaleTimeString('ru-RU');
 const contains = (r: Range | undefined, file: string, offset: number) => !!r && r.file === file && r.start <= offset && offset <= r.end;
 const size = (r: Range) => r.end - r.start;
 
-function download(file: SourceFile) {
-  const url = URL.createObjectURL(new Blob([file.content], { type: 'text/x-java' }));
-  const a = Object.assign(document.createElement('a'), { href: url, download: file.path.split('/').pop() });
-  a.click();
-  URL.revokeObjectURL(url);
-}
 
 const TYPE_KIND: Record<TypeInfo['kind'], string> = { class: 'class', interface: 'interface', enum: 'enum', record: 'record' };
 
@@ -105,7 +138,7 @@ export function App() {
   const [analysis, setAnalysis] = useState<AnalyzeResult | null>(null);
   const [analyzedFiles, setAnalyzedFiles] = useState<SourceFile[] | null>(null);
   // Уровни: приложения → классы в границах приложений → методы → блок-схема метода.
-  const [view, setView] = useState<'apps' | 'boundaries' | 'classes' | 'flow' | 'decompose'>('classes');
+  const [view, setView] = useState<'apps' | 'boundaries' | 'classes' | 'flow' | 'decompose' | 'review' | 'split'>('classes');
   const [decomposition, setDecomposition] = useState<DecompositionChoice>({ appId: null, variant: null });
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -129,6 +162,25 @@ export function App() {
   const [busy, setBusy] = useState<'run' | 'verify' | null>(null);
   const [bottomTab, setBottomTab] = useState<BottomTab>('console');
   const [java, setJava] = useState<JavaStatus>({ state: 'checking' });
+  const [showAnalysis, setShowAnalysis] = useStored('layout.analysis', true);
+  const [showBottom, setShowBottom] = useStored('layout.bottom', true);
+  /** Высота нижнего ряда (код и консоль) в px; null — по умолчанию. */
+  const [bottomHeight, setBottomHeight] = useStored<number | null>('layout.bottomHeight', null);
+  // Версии: история коммитов проекта и файлы HEAD — от них считаются незафиксированные изменения.
+  const [history, setHistory] = useState<History | null>(null);
+  const [headFiles, setHeadFiles] = useState<SourceFile[] | null>(null);
+  /** Коммит, из которого взят эталон поведения; null — эталон не совпадает ни с одной версией. */
+  const [baselineId, setBaselineId] = useState<string | null>(null);
+  const [committing, setCommitting] = useState(false);
+  /** Ревью изменений: предложенные исправления, незафиксированные правки или коммит. id сбрасывает решения по фрагментам. */
+  const [review, setReview] = useState<(Review & { id: number }) | null>(null);
+  /** Идущее автоисправление: ход работы с сервера и отмена. */
+  const [fixRun, setFixRun] = useState<FixRun | null>(null);
+  /** Класс, который сейчас делится на несколько. */
+  const [splitTarget, setSplitTarget] = useState<SplitTarget | null>(null);
+  /** Папка проекта на диске — только для чтения: из неё собирается копия с изменениями. */
+  const [source, setSource] = useState<ProjectSource | null>(null);
+  const viewBeforeReview = useRef<typeof view>('classes');
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
 
@@ -139,6 +191,7 @@ export function App() {
   const stale = analyzedFiles !== files;
   // Код изменён относительно эталона, а проверка ещё не запускалась.
   const dirty = !!baseline && baseline.files !== files;
+  const changes = useMemo(() => (headFiles ? changedFiles(headFiles, files) : 0), [headFiles, files]);
 
   useEffect(() => {
     let cancelled = false; // StrictMode вызывает эффект дважды — пишем в консоль один раз
@@ -162,7 +215,7 @@ export function App() {
     api.settings().then(setSettings).catch((e) => log(`Настройки не загружены: ${e}`, 'error'));
   }, [log]);
 
-  // Тесты, тест-кейсы и выбор распила сохраняются в БД с небольшой задержкой после правки.
+  // Тесты, тест-кейсы и выбранный вариант микросервисов сохраняются в БД с небольшой задержкой после правки.
   useEffect(() => {
     if (!project) return;
     const timer = setTimeout(() => {
@@ -208,11 +261,34 @@ export function App() {
       log(`Сохранённое состояние проекта не загружено: ${e}`, 'error');
     }
     setProject({ key, name });
+    // Первая загрузка проекта — первый коммит. Загруженные файлы — рабочая копия: отличия от HEAD видны как изменения.
+    try {
+      const h = await api.history(key);
+      if (!h.head) {
+        const r = await api.commit(key, 'Исходная версия', loaded, null);
+        setHistory(r.history);
+        setHeadFiles(loaded);
+        setBaselineId(r.commit.id);
+      } else {
+        const head = await api.commitFiles(key, h.head);
+        setHistory(h);
+        setHeadFiles(head);
+        setBaselineId(changedFiles(head, loaded) ? null : h.head);
+        log(`История версий: ${h.commits.length}, HEAD ${h.head.slice(0, 7)}.`);
+      }
+    } catch (e) {
+      log(`История версий не загружена: ${e}`, 'error');
+    }
   };
 
-  const loadFiles = (loaded: SourceFile[], name: string) => {
+  const loadFiles = (loaded: SourceFile[], name: string, from: ProjectSource | null = null) => {
     if (!loaded.length) return log('В выбранных файлах нет .java', 'error');
     setProject(null);
+    setSource(from);
+    setHistory(null);
+    setHeadFiles(null);
+    setBaselineId(null);
+    setReview(null);
     setDecomposition({ appId: null, variant: null });
     void restoreProject(loaded, name);
     setFiles(loaded);
@@ -234,11 +310,11 @@ export function App() {
   const importFiles = async (input: HTMLInputElement) => {
     const list = input.files;
     if (!list?.length) return;
-    const { files: loaded, name, skipped } = await readJavaFiles(list);
+    const { files: loaded, name, skipped, source: from } = await readJavaFiles(list);
     input.value = ''; // повторный выбор той же папки снова вызовет onChange
     if (skipped.build) log(`Пропущено файлов из служебных каталогов (target, build, .git…): ${skipped.build}`);
     if (skipped.test) log(`Пропущено тестов из src/test (JUnit недоступен для запуска): ${skipped.test}`);
-    loadFiles(loaded, name);
+    loadFiles(loaded, name, from);
   };
 
   const openExample = () => api.example().then((r) => loadFiles(r.files, 'Пример')).catch(() => log('Не удалось загрузить пример: сервер недоступен', 'error'));
@@ -317,6 +393,7 @@ export function App() {
 
   const apps = useMemo(() => analysis?.architecture.apps ?? [], [analysis]);
   const multiApp = apps.length > 1;
+  const hasStores = !!analysis?.architecture.stores.length;
   const appOfFile = useMemo(() => new Map(apps.flatMap((a) => a.files.map((f) => [f, a] as const))), [apps]);
   const filteredApp = apps.find((a) => a.id === appFilter);
   const methodApp = method ? appOfFile.get(method.range.file) : undefined;
@@ -414,6 +491,7 @@ export function App() {
   const run = async () => {
     setBusy('run');
     setBottomTab('console');
+    setShowBottom(true);
     log('Компиляция…');
     try {
       const r = await api.run(files, tests[0]?.stdin ?? '');
@@ -440,6 +518,7 @@ export function App() {
       const r = await api.compare(baseline.files, files, tests, unitCases);
       setCompare(r);
       setBottomTab('results');
+      setShowBottom(true);
       const compiles = r.originalCompile.ok && r.modifiedCompile.ok;
       if (compiles && r.runSkipped && r.total === 0) log(`Обе версии компилируются. Поведение не сравнивалось: ${r.runSkipped}.`);
       else if (compiles && r.passed === r.total) log(`Поведение сохранено: ${r.passed} из ${r.total}`, 'ok');
@@ -477,6 +556,7 @@ export function App() {
     const title = `${type.name}${methodId ? `.${casesTarget.method!.signature}` : ''}`;
     setGenerating(true);
     setBottomTab('cases');
+    setShowBottom(true);
     log(`Генерация тест-кейсов для ${title}${llm ? ' (эвристики + LLM)' : ' (эвристики)'}…`);
     try {
       const r = await api.cases(files, type.name, type.file, methodId, llm);
@@ -492,10 +572,212 @@ export function App() {
     }
   };
 
-  const pinBaseline = () => {
-    setBaseline({ files, at: now() });
-    setCompare(null);
-    log('Текущая версия зафиксирована как эталон', 'ok');
+  // ---------- Ревью и автоисправление ----------
+
+  const openReview = (r: Review) => {
+    if (view !== 'review') viewBeforeReview.current = view;
+    setReview({ ...r, id: Date.now() });
+    setView('review');
+  };
+  const closeReview = () => {
+    setReview(null);
+    setView(viewBeforeReview.current);
+  };
+
+  /**
+   * Исправления считаются по проанализированному коду: id проблем относятся к нему.
+   * Пока сервер работает, на месте ревью виден ход генерации; результат открывается в ревью.
+   */
+  const runJob = async (
+    run: Omit<FixRun, 'started' | 'events' | 'abort'>,
+    start: string,
+    call: (snapshot: SourceFile[], onProgress: (p: FixProgress) => void, signal: AbortSignal) => Promise<FixResult>,
+    reviewTitle: (r: FixResult) => string,
+    atomic = false,
+  ) => {
+    if (stale || !analyzedFiles || fixRun) return;
+    const snapshot = analyzedFiles;
+    const abort = new AbortController();
+    if (view !== 'review') viewBeforeReview.current = view;
+    setReview(null);
+    setFixRun({ ...run, started: Date.now(), events: [], abort });
+    setView('review');
+    log(start);
+    let opened = false;
+    try {
+      const r = await call(snapshot, (p) => setFixRun((cur) => cur && { ...cur, events: [...cur.events, { p, at: Date.now() }] }), abort.signal);
+      if (!changedFiles(snapshot, r.files)) {
+        log(`Не получилось${r.skipped.length ? `: ${r.skipped.slice(0, 3).map((x) => `${x.title} — ${x.reason}`).join('; ')}` : ''}`, 'error');
+        return;
+      }
+      log(`Предложено изменений: ${r.applied.length}${r.skipped.length ? `, не получилось: ${r.skipped.length}` : ''}. ${atomic ? 'Примите или отклоните правку целиком.' : 'Примите или отклоните фрагменты.'}`, 'ok');
+      setReview({ mode: 'fix', title: reviewTitle(r), base: snapshot, next: r.files, fix: r, atomic, id: Date.now() });
+      opened = true;
+    } catch (e) {
+      log(abort.signal.aborted ? 'Генерация отменена' : `Изменения не получены: ${e}`, abort.signal.aborted ? undefined : 'error');
+    } finally {
+      setFixRun(null);
+      // Без результата экран ревью пуст — возвращаемся туда, откуда начали.
+      if (!opened) setView((v) => (v === 'review' ? viewBeforeReview.current : v));
+    }
+  };
+
+  const fix = (ids: string[] | undefined, llm: boolean) =>
+    runJob(
+      { ids: ids ?? null, llm },
+      `Поиск исправлений${ids ? '' : ' для всех проблем'}${llm ? ' (правила + LLM, может занять несколько минут)' : ''}…`,
+      (snapshot, onProgress, signal) => api.fix({ files: snapshot, ids, llm, tests, unitCases }, onProgress, signal),
+      (r) => `Автоисправление · ${r.applied.length}`,
+    );
+
+  /** Паттерн применяет LLM; правка цельная (новые типы + изменённый метод), поэтому ревью — всё или ничего. */
+  const applyPattern = (f: PatternFinding) =>
+    runJob(
+      { ids: null, llm: true, title: `Применение: ${f.title}`, patternId: f.id },
+      `Применение паттерна «${f.title}» через LLM (может занять несколько минут)…`,
+      (snapshot, onProgress, signal) => api.applyPattern({ files: snapshot, findingId: f.id, tests, unitCases }, onProgress, signal),
+      () => f.title,
+      true,
+    );
+
+  const openSplit = (target: SplitTarget) => {
+    if (stale) return;
+    setSplitTarget(target);
+    setView('split');
+  };
+
+  const splitDone = (r: SplitResult, plan: SplitPlan) => {
+    const verdict = r.compiled === null ? 'Сборку проверить не удалось.'
+      : !r.compiled ? 'Не компилируется — см. ошибки ниже.'
+      : r.behaviorSame === null ? 'Проект компилируется; тестов для сравнения поведения нет.'
+      : r.behaviorSame ? `Проект компилируется, поведение совпало на ${r.tests} тест(ах).`
+      : 'Поведение изменилось — см. ниже.';
+    const fixResult: FixResult = {
+      files: r.files,
+      applied: [{ rule: 'extract-class', title: `${plan.typeName} → ${plan.parts.length} класса: ${plan.parts.slice(1).map((p) => p.name).join(', ')}`, source: 'rule', file: plan.file, line: 1, note: [verdict, ...r.notes].join(' ') }],
+      skipped: r.errors ? [{ title: 'Проверка не пройдена', file: plan.file, line: 1, reason: r.errors }] : [],
+    };
+    log(`${plan.typeName} разделён: ${r.created.join(', ')}. ${verdict}`, r.errors ? 'error' : 'ok');
+    viewBeforeReview.current = 'split';
+    setReview({ mode: 'fix', title: `Разделение ${plan.typeName}`, base: analyzedFiles ?? files, next: r.files, fix: fixResult, atomic: true, id: Date.now() });
+    setView('review');
+  };
+
+  /** Копия исходника с изменениями; файлы на диске приложение не меняет никогда. */
+  const exportCopy = async (snapshot: SourceFile[], suffix: string) => {
+    const name = project?.name ?? 'project';
+    try {
+      const changed = await exportProject(snapshot, source, name, suffix);
+      log(`Скачана копия «${name}-${suffix}.zip»${source ? `: изменённых файлов ${changed}, остальные — как в исходнике` : ''}. Исходный проект не изменён.`, 'ok');
+    } catch (e) {
+      log(`Копия не собрана: ${e}`, 'error');
+    }
+  };
+
+  const exportCommit = async (id: string) => {
+    if (!project) return;
+    try {
+      await exportCopy(id === history?.head && headFiles ? headFiles : await api.commitFiles(project.key, id), id.slice(0, 7));
+    } catch (e) {
+      log(`Версия не загружена: ${e}`, 'error');
+    }
+  };
+
+  const applyReview = (result: SourceFile[], { accepted, rejected }: { accepted: number; rejected: number }) => {
+    if (!review) return;
+    setFiles(result);
+    if (review.atomic) {
+      log(`Применено: ${review.title} — в рабочей копии приложения, исходные файлы на диске не изменены. Зафиксируйте версию и скачайте вариант кнопкой «Экспорт копии».`, 'ok');
+      if (review.title.startsWith('Разделение')) {
+        setSplitTarget(null);
+        viewBeforeReview.current = 'classes';
+      }
+    } else if (review.mode === 'fix') log(`Применено фрагментов: ${accepted}, отклонено: ${rejected} — в рабочей копии приложения, исходные файлы на диске не изменены. Проверьте поведение, зафиксируйте версию и скачайте исправленный вариант кнопкой «Экспорт копии».`, 'ok');
+    else log(`Откачено к HEAD фрагментов: ${rejected}`, 'ok');
+    closeReview();
+  };
+
+  const reviewOutdated = !!review && (review.mode === 'fix' ? review.base !== files : review.mode === 'changes' && review.next !== files);
+
+  /** Выделяет строку текущего кода: из ревью к месту правки. */
+  const locateLine = (path: string, line: number) => {
+    const f = files.find((x) => x.path === path);
+    if (!f) return;
+    let start = 0;
+    for (let i = 1; i < line; i++) {
+      const nl = f.content.indexOf('\n', start);
+      if (nl === -1) break;
+      start = nl + 1;
+    }
+    const nl = f.content.indexOf('\n', start);
+    pickRange({ file: path, start, end: nl === -1 ? f.content.length : nl, startLine: line, endLine: line });
+  };
+
+  // ---------- Версии ----------
+
+  const commitFiles = async (message: string, snapshot: SourceFile[]) => {
+    if (!project || !history) return;
+    setCommitting(true);
+    try {
+      const r = await api.commit(project.key, message, snapshot, history.head);
+      setHistory(r.history);
+      setHeadFiles(snapshot);
+      if (snapshot !== files) setFiles(snapshot);
+      log(`Версия ${r.commit.id.slice(0, 7)} «${message}»: изменено файлов ${r.commit.changed}`, 'ok');
+    } catch (e) {
+      log(`Версия не зафиксирована: ${e}`, 'error');
+    } finally {
+      setCommitting(false);
+    }
+  };
+
+  const checkout = async (id: string) => {
+    if (!project) return;
+    if (changes && !confirm(`Незафиксированные изменения (файлов: ${changes}) будут потеряны. Восстановить версию ${id.slice(0, 7)}?`)) return;
+    setCommitting(true);
+    try {
+      const restored = await api.commitFiles(project.key, id);
+      setHistory(await api.checkout(project.key, id));
+      setHeadFiles(restored);
+      setFiles(restored);
+      if (!restored.some((f) => f.path === activePath)) setActivePath(restored[0]?.path ?? null);
+      setSelectedNodeId(null);
+      log(`Восстановлена версия ${id.slice(0, 7)}. Новая фиксация продолжит историю от неё.`, 'ok');
+    } catch (e) {
+      log(`Версия не восстановлена: ${e}`, 'error');
+    } finally {
+      setCommitting(false);
+    }
+  };
+
+  const discardChanges = () => {
+    if (!headFiles || !confirm(`Отменить все незафиксированные изменения (файлов: ${changes})?`)) return;
+    setFiles(headFiles);
+    log('Незафиксированные изменения отменены', 'ok');
+  };
+
+  const showCommit = async (id: string) => {
+    const c = history?.commits.find((x) => x.id === id);
+    if (!project || !c?.parentId) return;
+    try {
+      const [base, next] = await Promise.all([api.commitFiles(project.key, c.parentId), api.commitFiles(project.key, id)]);
+      openReview({ mode: 'commit', title: `${id.slice(0, 7)} · ${c.message}`, base, next });
+    } catch (e) {
+      log(`Изменения версии не загружены: ${e}`, 'error');
+    }
+  };
+
+  const baselineFromCommit = async (id: string) => {
+    if (!project) return;
+    try {
+      const snapshot = id === history?.head && headFiles ? headFiles : await api.commitFiles(project.key, id);
+      setBaseline({ files: snapshot, at: now() });
+      setBaselineId(id);
+      setCompare(null);
+      log(`Эталон поведения — версия ${id.slice(0, 7)}`, 'ok');
+    } catch (e) {
+      log(`Эталон не изменён: ${e}`, 'error');
+    }
   };
 
   const updateActiveFile = (content: string) => {
@@ -511,6 +793,32 @@ export function App() {
         : 'bad'
   );
   const javaReady = java.state === 'ok';
+
+  const startResize = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    const move = (ev: PointerEvent) => {
+      const max = window.innerHeight - TOOLBAR_H - CANVAS_MIN;
+      setBottomHeight(Math.round(Math.min(max, Math.max(BOTTOM_MIN, window.innerHeight - ev.clientY))));
+    };
+    const stop = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', stop);
+      handle.removeEventListener('pointercancel', stop);
+      document.body.classList.remove('is-resizing');
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', stop);
+    handle.addEventListener('pointercancel', stop);
+    document.body.classList.add('is-resizing');
+  };
+
+  // Скрытая панель отдаёт свою ячейку соседу слева: схеме или коду.
+  const layoutStyle = {
+    '--areas': `'toolbar toolbar toolbar' 'sidebar canvas ${showAnalysis ? 'analysis' : 'canvas'}' 'sidebar code ${showBottom ? 'bottom' : 'code'}'`,
+    ...(bottomHeight ? { '--bottom-h': `${bottomHeight}px` } : {}),
+  } as CSSProperties;
 
   // Метод и его лямбды; лямбды раскрываются, когда открыт метод или одна из его лямбд.
   function renderMethod(m: MethodInfo, depth: number): ReactElement {
@@ -539,11 +847,11 @@ export function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" style={layoutStyle}>
       <header className="toolbar">
         <div className="brand">
           <Logo />
-          <span>Java Blueprints</span>
+          <span>Dark Secrets</span>
         </div>
         <input ref={fileInput} type="file" accept=".java" multiple hidden onChange={(e) => importFiles(e.currentTarget)} />
         {/* webkitdirectory нет в типах React — атрибут ставится через ref */}
@@ -563,12 +871,28 @@ export function App() {
           <button className="btn ghost" onClick={openExample}>
             <FileCode size={15} /> Пример
           </button>
-          <button className="btn ghost" disabled={!files.length} onClick={() => files.forEach(download)}>
-            <Download size={15} /> Экспорт
+          <button
+            className="btn ghost"
+            disabled={!files.length}
+            onClick={() => exportCopy(files, 'fixed')}
+            title="Скачать zip-копию проекта с текущими изменениями. Исходные файлы на диске не меняются."
+          >
+            <Download size={15} /> Экспорт копии
           </button>
         </div>
 
         <div className="status-strip">
+          {fixRun && (() => {
+            const p = fixRun.events.at(-1)?.p;
+            return (
+              <button className="status is-busy" onClick={() => setView('review')} title="Показать ход генерации">
+                <LoaderCircle size={13} className="spin" />
+                {fixRun.title ?? (fixRun.llm ? 'Генерация исправлений' : 'Поиск исправлений')}
+                {p?.method && <span className="status-detail mono">{p.method.replace(/\(.*$/, '()')} · {p.attempt}/{p.maxAttempts}</span>}
+                <Elapsed since={fixRun.started} />
+              </button>
+            );
+          })()}
           <span className={`status ${javaReady ? 'is-ok' : java.state === 'checking' ? '' : 'is-bad'}`} title={javaReady ? java.version : undefined}>
             <span className="dot" />
             {java.state === 'checking' ? 'Проверка JDK' : javaReady ? java.version : java.state === 'offline' ? 'Сервер недоступен' : 'JDK не найден'}
@@ -588,11 +912,14 @@ export function App() {
         </div>
 
         <div className="btn-group">
+          <button className={`icon-btn neutral toggle${showAnalysis ? ' is-on' : ''}`} onClick={() => setShowAnalysis((v) => !v)} aria-pressed={showAnalysis} aria-label="Панель проблем" title={showAnalysis ? 'Скрыть проблемы и метрики' : 'Показать проблемы и метрики'}>
+            <PanelRight size={16} />
+          </button>
+          <button className={`icon-btn neutral toggle${showBottom ? ' is-on' : ''}`} onClick={() => setShowBottom((v) => !v)} aria-pressed={showBottom} aria-label="Нижняя панель" title={showBottom ? 'Скрыть консоль и тесты' : 'Показать консоль и тесты'}>
+            <PanelBottom size={16} />
+          </button>
           <button className="icon-btn neutral" onClick={() => setShowSettings(true)} disabled={!settings} aria-label="Настройки" title="Настройки">
             <Settings size={16} />
-          </button>
-          <button className="btn ghost" disabled={!files.length} onClick={pinBaseline} title="Сделать текущую версию эталоном для сравнения">
-            <Pin size={15} /> Зафиксировать эталон
           </button>
           <button className="btn" disabled={!files.length || !!busy || !javaReady} onClick={run} title={javaReady ? undefined : 'Нужен JDK'}>
             {busy === 'run' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />} Запуск
@@ -639,6 +966,11 @@ export function App() {
                       {t.typeParameters && <span className="type-params">{t.typeParameters}</span>}
                     </span>
                     {details && <span className="tree-details mono ellipsis" title={details}>{details}</span>}
+                    {t.kind === 'class' && !t.outer && t.methods.length > 1 && (
+                      <button className="icon-btn neutral tree-split" disabled={stale} onClick={() => openSplit({ file: t.file, typeName: t.name })} aria-label={`Разделить ${t.name}`} title="Разделить класс на несколько">
+                        <Scissors size={12} />
+                      </button>
+                    )}
                   </div>
                   {t.methods.filter((m) => m.kind !== 'lambda').map((m) => renderMethod(m, 0))}
                 </div>
@@ -683,10 +1015,18 @@ export function App() {
         {analysis && (
           <div className="canvas-bar">
             <div className="tabs" role="tablist" aria-label="Уровень детализации">
-              {multiApp && <button role="tab" aria-selected={view === 'apps'} onClick={() => setView('apps')}><Network size={14} /> Приложения</button>}
+              {(multiApp || hasStores) && <button role="tab" aria-selected={view === 'apps'} onClick={() => setView('apps')} title="Приложения, внешние сервисы и базы данных"><Network size={14} /> {multiApp ? 'Приложения' : 'Схема'}</button>}
               {multiApp && <button role="tab" aria-selected={view === 'boundaries'} onClick={() => openBoundaries(null)}><Boxes size={14} /> Границы</button>}
               <button role="tab" aria-selected={view === 'classes' || view === 'flow'} onClick={() => setView('classes')}><LayoutGrid size={14} /> Методы</button>
-              <button role="tab" aria-selected={view === 'decompose'} onClick={() => setView('decompose')} title="Варианты распила на микросервисы"><Scissors size={14} /> Распил</button>
+              <button role="tab" aria-selected={view === 'decompose'} onClick={() => setView('decompose')} title="Варианты разделения на микросервисы: классы, данные, связи"><Blocks size={14} /> Микросервисы</button>
+              {splitTarget && (
+                <button role="tab" aria-selected={view === 'split'} onClick={() => setView('split')}><Scissors size={14} /> {splitTarget.typeName.split('.').pop()}</button>
+              )}
+              {(review || fixRun) && (
+                <button role="tab" aria-selected={view === 'review'} onClick={() => setView('review')}>
+                  {fixRun ? <LoaderCircle size={14} className="spin" /> : <FileDiff size={14} />} Ревью
+                </button>
+              )}
             </div>
             {multiApp && view === 'classes' && (
               <select className="app-select" value={appFilter ?? ''} onChange={(e) => openAppMethods(e.target.value || null)} aria-label="Приложение">
@@ -726,6 +1066,8 @@ export function App() {
                 : view === 'apps' ? 'Клик — подробности, двойной клик — классы приложения'
                 : view === 'boundaries' ? 'Клик по классу — его методы'
                 : view === 'decompose' ? 'Клик по рамке — детали сервиса, по классу — его методы'
+                : view === 'review' ? 'Примите или отклоните каждый фрагмент'
+                : view === 'split' ? 'Выберите число классов и состав каждого'
                 : 'Клик по методу — открыть блок-схему'}
             </span>
           </div>
@@ -756,6 +1098,34 @@ export function App() {
           {analysis && view === 'decompose' && (
             <DecomposeView files={analyzedFiles ?? files} apps={apps} choice={decomposition} onChoiceChange={setDecomposition} onOpenType={openTypeMethods} onPickRange={pickRange} />
           )}
+          {view === 'split' && splitTarget && (
+            <SplitView
+              target={splitTarget}
+              files={analyzedFiles ?? files}
+              tests={tests}
+              unitCases={unitCases}
+              onDone={splitDone}
+              onClose={() => {
+                setSplitTarget(null);
+                setView('classes');
+              }}
+            />
+          )}
+          {view === 'review' && !review && fixRun && <FixProgressView run={fixRun} onCancel={() => fixRun.abort.abort()} />}
+          {view === 'review' && review && (
+            <ReviewView
+              key={review.id}
+              review={review}
+              outdated={reviewOutdated}
+              onApply={applyReview}
+              onCommit={(result, message) => {
+                void commitFiles(message, result);
+                closeReview();
+              }}
+              onClose={closeReview}
+              onLocate={locateLine}
+            />
+          )}
           {analysis && view === 'flow' && flow && (
             <FlowView flow={flow} nodeSeverity={nodeSeverity} nodeScope={nodeScope} selectedNodeId={selectedNodeId} onSelect={selectNode} onEdit={editNode} onOpenLambda={openMethodCb} />
           )}
@@ -763,11 +1133,31 @@ export function App() {
       </main>
 
       <AnalysisPanel
+        hidden={!showAnalysis}
+        onHide={() => setShowAnalysis(false)}
         analysis={analysis}
         selectedMethodId={view === 'flow' ? methodId : null}
         selectedDiagnosticId={selectedDiagnosticId}
         onPick={pickDiagnostic}
         onPickScope={pickScope}
+        onFix={fix}
+        fixingIds={fixRun ? fixRun.ids ?? 'all' : null}
+        canFix={!stale && !!analysis}
+        llmDefault={settings?.llmByDefault ?? true}
+        onPickPattern={(f) => pickRange(f.range)}
+        onApplyPattern={applyPattern}
+        onSplit={(f) => f.typeName && openSplit({ file: f.range.file, typeName: f.typeName })}
+        applyingPatternId={fixRun?.patternId ?? null}
+      />
+
+      <div
+        className="row-resizer"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Высота панели кода"
+        title="Потяните, чтобы изменить высоту; двойной клик — по умолчанию"
+        onPointerDown={startResize}
+        onDoubleClick={() => setBottomHeight(null)}
       />
 
       <section className="code" aria-label="Код Java">
@@ -805,6 +1195,8 @@ export function App() {
       )}
 
       <BottomPanel
+        hidden={!showBottom}
+        onHide={() => setShowBottom(false)}
         tab={bottomTab}
         onTabChange={setBottomTab}
         logs={logs}
@@ -823,6 +1215,22 @@ export function App() {
             onGenerate={generateUnitCases}
             results={unitResults}
             llmDefault={settings?.llmByDefault ?? true}
+          />
+        }
+        changes={changes}
+        historyPanel={
+          <HistoryPanel
+            history={history}
+            changes={changes}
+            baselineId={baselineId}
+            busy={committing}
+            onCommit={(message) => commitFiles(message, files)}
+            onReviewChanges={() => headFiles && openReview({ mode: 'changes', title: 'Незафиксированные изменения', base: headFiles, next: files })}
+            onDiscard={discardChanges}
+            onShowCommit={showCommit}
+            onCheckout={checkout}
+            onBaseline={baselineFromCommit}
+            onExport={exportCommit}
           />
         }
       />

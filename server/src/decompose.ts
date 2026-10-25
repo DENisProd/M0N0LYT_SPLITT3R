@@ -1,5 +1,9 @@
 import type {
   AnalyzeResult,
+  CrossJoin,
+  DataAccess,
+  DataSplit,
+  DataStore,
   DecompositionMetrics,
   DecompositionResult,
   DecompositionStrategy,
@@ -7,13 +11,15 @@ import type {
   DecompositionVariant,
   ProposedService,
   ServiceDependency,
+  ServiceStore,
+  SharedTable,
   SourceFile,
   TypeInfo,
   TypeRole,
 } from '../../shared/types.ts';
 import { findBottlenecks, stronglyConnected, type TransactionSpan } from './bottlenecks.ts';
 
-// Распил приложения на микросервисы: граф зависимостей классов и несколько способов его разрезать.
+// Разделение приложения на микросервисы: граф зависимостей классов и несколько способов его разрезать.
 // Каждый способ — эвристика; варианты сравниваются одними и теми же метриками.
 
 const typeKey = (t: Pick<TypeInfo, 'file' | 'name'>) => `${t.file}:${t.name}`;
@@ -195,6 +201,78 @@ interface Context {
   endpointsOf: Map<string, string[]>;
   /** Транзакции, которые трогают несколько агрегатов. */
   transactions: TransactionSpan[];
+  /** Обращения к хранилищам из классов приложения и сами хранилища. */
+  access: DataAccess[];
+  stores: DataStore[];
+}
+
+/** Класс обращения → ключ класса верхнего уровня, как в графе зависимостей классов. */
+const accessKey = (a: DataAccess) => `${a.file}:${a.type.split('.')[0]}`;
+
+/**
+ * Database per service: таблица достаётся сервису, в котором её сущность, а без сущности — тому, кто больше пишет
+ * (затем — больше обращается). Остальные сервисы, которые к ней ходят, — общие таблицы; запрос, соединяющий
+ * таблицы разных владельцев, — JOIN через границу. Хранилища без таблиц (Redis) не делятся.
+ */
+function splitData(services: ProposedService[], serviceOf: Map<string, string>, ctx: Context): DataSplit {
+  const result: DataSplit = { services: Object.fromEntries(services.map((s) => [s.id, []])), shared: [], joins: [] };
+  const key = (store: string, table: string) => `${store}\u0000${table.toLowerCase()}`;
+  type Usage = { reads: number; writes: number; access: DataAccess[] };
+  const usage = new Map<string, Map<string, Usage>>();
+  for (const a of ctx.access) {
+    const svc = serviceOf.get(accessKey(a));
+    if (!svc) continue;
+    for (const t of a.tables?.length ? a.tables : a.table ? [a.table] : []) {
+      const row = usage.get(key(a.store, t)) ?? new Map<string, Usage>();
+      const u = row.get(svc) ?? { reads: 0, writes: 0, access: [] };
+      if (a.op === 'write') u.writes++;
+      else u.reads++;
+      if (!u.access.includes(a)) u.access.push(a);
+      row.set(svc, u);
+      usage.set(key(a.store, t), row);
+    }
+  }
+  const owner = new Map<string, string>();
+  const base = (name: string) => name.replace(/-service(-\d+)?$/, '');
+  for (const store of ctx.stores.filter((s) => ctx.access.some((a) => a.store === s.id) || s.tables.some((t) => t.entityFile && serviceOf.has(`${t.entityFile}:${t.entity}`)))) {
+    if (!store.tables.length) {
+      // Кэш или поиск без известных таблиц: им пользуются вместе.
+      const users = new Set(ctx.access.filter((a) => a.store === store.id).map((a) => serviceOf.get(accessKey(a))).filter((x): x is string => !!x));
+      for (const svc of users) result.services[svc].push({ store: store.id, kind: store.kind, engine: store.engine, name: store.name, tables: [], shared: users.size > 1 });
+      continue;
+    }
+    const own = new Map<string, ServiceStore>();
+    for (const t of store.tables) {
+      const row = usage.get(key(store.id, t.name)) ?? new Map<string, Usage>();
+      const byEntity = t.entity && t.entityFile ? serviceOf.get(`${t.entityFile}:${t.entity}`) : undefined;
+      const ranked = [...row].sort((a, b) => b[1].writes - a[1].writes || b[1].reads + b[1].writes - (a[1].reads + a[1].writes));
+      const svc = byEntity ?? ranked[0]?.[0];
+      if (!svc) continue;
+      const reason = byEntity ? `сущность ${t.entity} в коде сервиса` : ranked[0][1].writes ? 'больше всего записей' : 'больше всего обращений';
+      owner.set(key(store.id, t.name), svc);
+      const ss = own.get(svc) ?? { store: store.id, kind: store.kind, engine: store.engine, name: `${base(svc)}-db`, tables: [] };
+      ss.tables.push(t.name);
+      own.set(svc, ss);
+      const users = [...row].filter(([s]) => s !== svc);
+      if (users.length) {
+        result.shared.push({
+          store: store.id, table: t.name, owner: svc, ownerReason: reason,
+          users: users.map(([service, u]) => ({ service, reads: u.reads, writes: u.writes, access: u.access.slice(0, 8).map((a) => ({ detail: a.detail, type: a.type, range: a.range })) })),
+        });
+      }
+    }
+    for (const [svc, ss] of own) result.services[svc].push(ss);
+  }
+  const seen = new Set<string>();
+  for (const a of ctx.access) {
+    if ((a.tables?.length ?? 0) < 2 || seen.has(`${a.file}:${a.range.start}`)) continue;
+    const owners = [...new Set(a.tables!.map((t) => owner.get(key(a.store, t))).filter((x): x is string => !!x))];
+    if (owners.length < 2) continue;
+    seen.add(`${a.file}:${a.range.start}`);
+    result.joins.push({ detail: a.detail, tables: a.tables!, services: owners, type: a.type, range: a.range } satisfies CrossJoin);
+  }
+  result.shared.sort((a, b) => b.users.reduce((n, u) => n + u.writes, 0) - a.users.reduce((n, u) => n + u.writes, 0));
+  return result;
 }
 
 /** Из разбиения классов — сервисы, общий модуль, зависимости, метрики и оценка. */
@@ -305,6 +383,9 @@ function buildVariant(id: DecompositionStrategy, title: string, description: str
     .map((t) => ({ t, services: [...new Set(t.aggregates.map((a) => serviceOf.get(a)).filter((x): x is string => !!x))] }))
     .filter((x) => x.services.length >= 2);
 
+  const data = splitData(services, serviceOf, ctx);
+  const foreignWrites = data.shared.filter((t) => t.users.some((u) => u.writes > 0));
+
   const totalLines = services.reduce((s, x) => s + x.lines, 0) || 1;
   const metrics: DecompositionMetrics = {
     services: services.length,
@@ -315,12 +396,13 @@ function buildVariant(id: DecompositionStrategy, title: string, description: str
     sharedEntities,
     largestShare: services[0].lines / totalLines,
     distributedTransactions: distributed.length,
+    sharedTables: data.shared.length,
   };
 
   const score = Math.max(0, Math.min(100, Math.round(
     50 * metrics.cohesion + 50 * Math.min(1, Math.max(0, modularity) / 0.6)
     - 12 * metrics.cycles.length - 5 * sharedEntities.length - (metrics.largestShare > 0.7 ? 20 : 0)
-    - Math.min(18, 6 * distributed.length),
+    - Math.min(18, 6 * distributed.length) - Math.min(12, 4 * foreignWrites.length) - Math.min(12, 4 * data.joins.length),
   )));
 
   const pros: string[] = [];
@@ -335,13 +417,22 @@ function buildVariant(id: DecompositionStrategy, title: string, description: str
   for (const d of distributed.slice(0, 3)) cons.push(`Транзакция ${d.t.label} разойдётся по ${d.services.join(', ')} — понадобится сага или outbox`);
   if (distributed.length > 3) cons.push(`…и ещё ${distributed.length - 3} распределённых транзакций`);
   if (!distributed.length && ctx.transactions.length) pros.push('Транзакции через несколько агрегатов остаются внутри одного сервиса');
-  if (metrics.largestShare > 0.7) cons.push(`${services[0].name} содержит ${pct(metrics.largestShare)} кода — распил почти ничего не отделяет`);
+  const hasTables = Object.values(data.services).some((ss) => ss.some((x) => x.tables.length));
+  if (hasTables && !data.shared.length && !data.joins.length) pros.push('Таблицы делятся без пересечений: у каждого сервиса своя база, чужие таблицы никто не читает');
+  for (const t of data.shared.slice(0, 4)) {
+    const who = t.users.map((u) => `${u.service} (${u.writes ? `запись ${u.writes}` : `чтение ${u.reads}`})`).join(', ');
+    cons.push(`Таблица ${t.table} уходит в ${t.owner}, но с ней работают ${who} — ${t.users.some((u) => u.writes) ? 'записи нужно перевести на API владельца' : 'нужен API владельца или копия данных по событиям'}`);
+  }
+  if (data.shared.length > 4) cons.push(`…и ещё ${data.shared.length - 4} общих таблиц`);
+  for (const j of data.joins.slice(0, 3)) cons.push(`${j.type}: запрос соединяет ${j.tables.join(', ')} из ${j.services.join(' и ')} — одним SQL после разделения не выполнить`);
+  if (data.joins.length > 3) cons.push(`…и ещё ${data.joins.length - 3} запросов через границы`);
+  if (metrics.largestShare > 0.7) cons.push(`${services[0].name} содержит ${pct(metrics.largestShare)} кода — разделение почти ничего не отделяет`);
   else if (services.length >= 2 && metrics.largestShare < 0.5) pros.push('Сервисы сопоставимы по размеру');
   if (shared.length) cons.push(`Общий модуль из ${shared.length} классов (DTO, исключения) — его версии придётся согласовывать между сервисами`);
   const tiny = services.filter((s) => s.types.length <= 2);
   if (tiny.length) cons.push(`Слишком мелкие сервисы: ${tiny.map((s) => s.name).join(', ')} — накладные расходы на деплой больше пользы`);
 
-  return { id, title, description, services, shared, dependencies, metrics, score, pros, cons, recommended: false };
+  return { id, title, description, services, shared, dependencies, metrics, data, score, pros, cons, recommended: false };
 }
 
 // ---------- Точка входа ----------
@@ -355,7 +446,7 @@ export function decompose(files: SourceFile[], analysis: AnalyzeResult, appId: s
   const sources = new Map(files.map((f) => [f.path, f.content]));
   const notes: string[] = [];
 
-  // Вложенные типы считаются частью внешнего: распиливаются только файлы верхнего уровня.
+  // Вложенные типы считаются частью внешнего: делятся только файлы верхнего уровня.
   const all = analysis.types.filter((t) => !scopeFiles || scopeFiles.has(t.file));
   const topOf = (t: TypeInfo): TypeInfo => {
     let cur = t;
@@ -441,7 +532,8 @@ export function decompose(files: SourceFile[], analysis: AnalyzeResult, appId: s
     types, infos: new Map(top.map((t) => [typeKey(t), t])), out: g.out, calls: g.calls, stemOf: (k) => stem(types.get(k)?.name ?? k),
     aggregateOf, refs, sources, analysis, methodType, endpoints: (app ? [app] : apps).flatMap((a) => a.endpoints),
   });
-  const ctx: Context = { g, types, endpointsOf, transactions };
+  const access = analysis.architecture.access.filter((a) => !scopeFiles || scopeFiles.has(a.file));
+  const ctx: Context = { g, types, endpointsOf, transactions, access, stores: analysis.architecture.stores };
   const nameOfType = (n: string) => types.get(n)!.name;
   // Имя сервиса — по главному классу: сущность, затем контроллер, сервис, прочие.
   const rank: Record<TypeRole, number> = { entity: 6, controller: 5, listener: 4, service: 4, repository: 3, other: 2, dto: 1, config: 0 };
@@ -460,8 +552,8 @@ export function decompose(files: SourceFile[], analysis: AnalyzeResult, appId: s
   };
 
   if (domain.length < MIN_DOMAIN) {
-    notes.push(`В ${app?.name ?? 'проекте'} связанных классов ${domain.length} (без конфигурации) — приложение уже размером с микросервис, распиливать нечего.`);
-    return { appId: app?.id ?? null, appName: app?.name ?? 'Проект', types: [...types.values()], edges: [], infra, isolated, variants, bottlenecks, notes };
+    notes.push(`В ${app?.name ?? 'проекте'} связанных классов ${domain.length} (без конфигурации) — приложение уже размером с микросервис, делить нечего.`);
+    return { appId: app?.id ?? null, appName: app?.name ?? 'Проект', types: [...types.values()], edges: [], access: [], infra, isolated, variants, bottlenecks, notes };
   }
 
   // 1. По сущностям: агрегат = сущность и то, чем она владеет (@OneToMany, @Embedded, @ElementCollection).
@@ -533,7 +625,7 @@ export function decompose(files: SourceFile[], analysis: AnalyzeResult, appId: s
   const segments = new Set(pkgs.map((p) => p[prefix]).filter(Boolean));
   if (segments.size < 2) notes.push('Вариант «по пакетам» не предложен: классы лежат в одном пакете.');
   else if ([...segments].filter((s) => LAYER_PACKAGES.has(s)).length >= segments.size / 2) {
-    notes.push(`Вариант «по пакетам» не предложен: пакеты разбиты по слоям (${[...segments].join(', ')}). Такой распил даёт распределённый монолит — каждый запрос проходит через все сервисы.`);
+    notes.push(`Вариант «по пакетам» не предложен: пакеты разбиты по слоям (${[...segments].join(', ')}). Такое разделение даёт распределённый монолит — каждый запрос проходит через все сервисы.`);
   } else {
     const seed: Assignment = new Map(domain.map((n, i) => [n, pkgs[i][prefix] ?? '']).filter(([, s]) => s && !LAYER_PACKAGES.has(s)) as [string, string][]);
     push(
@@ -554,5 +646,5 @@ export function decompose(files: SourceFile[], analysis: AnalyzeResult, appId: s
   if (unique[0]) unique[0].recommended = true;
 
   const edges = [...g.out].flatMap(([source, row]) => [...row].map(([target, weight]) => ({ source, target, weight })));
-  return { appId: app?.id ?? null, appName: app?.name ?? 'Проект', types: [...types.values()], edges, infra, isolated, variants: unique, bottlenecks, notes };
+  return { appId: app?.id ?? null, appName: app?.name ?? 'Проект', types: [...types.values()], edges, access, infra, isolated, variants: unique, bottlenecks, notes };
 }

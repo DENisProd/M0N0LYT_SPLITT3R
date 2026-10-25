@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type CSSProperties } from 'react';
 import { Boxes, Globe, Library, Radio, Server, TriangleAlert, X } from 'lucide-react';
 import { Background, Controls, Handle, MarkerType, Panel, Position, ReactFlow, type Edge, type Node, type NodeProps } from '@xyflow/react';
 import type { AnalyzeResult, AppInfo, AppLink, ExternalNode, Range } from '../../../shared/types.ts';
+import { STORE_W, StoreNode, storeHeight } from './StoreNode.tsx';
 import { layoutGraph } from '../layout.ts';
 import { LINK } from '../theme.ts';
 
@@ -60,16 +61,21 @@ function ExtNode({ data }: NodeProps<Node<ExtData>>) {
   );
 }
 
-const nodeTypes = { app: AppNode, ext: ExtNode };
+const nodeTypes = { app: AppNode, ext: ExtNode, store: StoreNode };
 
 /** Подпись ребра: что именно связывает приложения. */
 function linkLabel(l: AppLink): string {
   if (l.kind === 'library') return `код · ${l.calls.length}`;
+  if (l.kind === 'data') {
+    // detail обращения: "orders · OrderRepository.save"
+    const tables = [...new Set(l.calls.map((c) => c.detail.split(' · ')[1] ? c.detail.split(' · ')[0] : '').filter(Boolean))];
+    return tables.length ? `${tables.slice(0, 3).join(', ')}${tables.length > 3 ? ` +${tables.length - 3}` : ''}` : `обращений ${l.calls.length}`;
+  }
   const details = [...new Set(l.calls.map((c) => c.detail))];
   return details.length > 2 ? `${details.slice(0, 2).join(', ')} +${details.length - 2}` : details.join(', ');
 }
 
-type Selection = { kind: 'app' | 'link'; id: string } | null;
+type Selection = { kind: 'app' | 'link' | 'store'; id: string } | null;
 
 interface Props {
   analysis: AnalyzeResult;
@@ -80,7 +86,7 @@ interface Props {
 
 /** Уровень 1: приложения проекта и связи между ними (HTTP, сообщения, общий код). */
 export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRange }: Props) {
-  const { apps, externals, links } = analysis.architecture;
+  const { apps, externals, links, stores, access } = analysis.architecture;
   const [selection, setSelection] = useState<Selection>(null);
   const [pos, setPos] = useState<Map<string, { x: number; y: number }> | null>(null);
 
@@ -99,14 +105,18 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
   useEffect(() => {
     let cancelled = false;
     layoutGraph(
-      [...apps.map((a) => ({ id: a.id, width: APP_W, height: APP_H })), ...externals.map((e) => ({ id: e.id, width: EXT_W, height: EXT_H }))],
+      [
+        ...apps.map((a) => ({ id: a.id, width: APP_W, height: APP_H })),
+        ...externals.map((e) => ({ id: e.id, width: EXT_W, height: EXT_H })),
+        ...stores.map((s) => ({ id: s.id, width: STORE_W, height: storeHeight(s.tables.length) })),
+      ],
       links.map((l) => ({ id: l.id, source: l.from, target: l.to })),
       'RIGHT',
     ).then((p) => !cancelled && setPos(p));
     return () => {
       cancelled = true;
     };
-  }, [apps, externals, links]);
+  }, [apps, externals, links, stores]);
 
   const nodes = useMemo<Node[]>(
     () => [
@@ -122,8 +132,14 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
         position: pos?.get(e.id) ?? { x: 0, y: 0 },
         data: { ext: e, selected: false },
       })),
+      ...stores.map((s) => ({
+        id: s.id,
+        type: 'store',
+        position: pos?.get(s.id) ?? { x: 0, y: 0 },
+        data: { kind: s.kind, engine: s.engine, name: s.name, tables: s.tables.map((t) => t.name), unknown: !s.url, selected: selection?.kind === 'store' && selection.id === s.id },
+      })),
     ],
-    [apps, externals, pos, stats, selection],
+    [apps, externals, stores, pos, stats, selection],
   );
 
   const edges = useMemo<Edge[]>(
@@ -153,7 +169,8 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
 
   const app = selection?.kind === 'app' ? apps.find((a) => a.id === selection.id) : undefined;
   const link = selection?.kind === 'link' ? links.find((l) => l.id === selection.id) : undefined;
-  const nameOf = (id: string) => apps.find((a) => a.id === id)?.name ?? externals.find((e) => e.id === id)?.label ?? id;
+  const store = selection?.kind === 'store' ? stores.find((s) => s.id === selection.id) : undefined;
+  const nameOf = (id: string) => apps.find((a) => a.id === id)?.name ?? externals.find((e) => e.id === id)?.label ?? stores.find((s) => s.id === id)?.name ?? id;
 
   return (
     <ReactFlow
@@ -163,7 +180,7 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
       fitView
       minZoom={0.1}
       nodesDraggable={false}
-      onNodeClick={(_, n) => setSelection(n.type === 'app' ? { kind: 'app', id: n.id } : null)}
+      onNodeClick={(_, n) => setSelection(n.type === 'app' || n.type === 'store' ? { kind: n.type, id: n.id } : null)}
       onNodeDoubleClick={(_, n) => n.type === 'app' && onOpenBoundaries(n.id)}
       onEdgeClick={(_, e) => setSelection({ kind: 'link', id: e.id })}
       onPaneClick={() => setSelection(null)}
@@ -178,7 +195,7 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
           ))}
         </div>
       </Panel>
-      {(app || link) && (
+      {(app || link || store) && (
         <Panel position="top-right" className="inspector">
           <button className="inspector-close" onClick={() => setSelection(null)} aria-label="Закрыть"><X size={14} /></button>
           {app && (
@@ -203,6 +220,7 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
               </ul>
             </>
           )}
+          {store && <StoreInspector store={store} access={access.filter((a) => a.store === store.id)} appName={nameOf} onPickRange={onPickRange} />}
           {link && (
             <>
               <div className="inspector-title" style={{ color: LINK[link.kind].color }}>{LINK[link.kind].title}</div>
@@ -223,5 +241,50 @@ export function AppsView({ analysis, onOpenBoundaries, onOpenMethods, onPickRang
         </Panel>
       )}
     </ReactFlow>
+  );
+}
+
+/** Хранилище: адрес, таблицы и кто к ним обращается. */
+function StoreInspector({ store, access, appName, onPickRange }: {
+  store: AnalyzeResult['architecture']['stores'][number]; access: AnalyzeResult['architecture']['access']; appName: (id: string) => string; onPickRange: (r: Range) => void;
+}) {
+  const byTable = new Map<string, typeof access>();
+  for (const a of access) for (const t of a.tables?.length ? a.tables : [a.table ?? '']) byTable.set(t, [...(byTable.get(t) ?? []), a]);
+  const apps = [...new Set(access.map((a) => a.app))];
+  return (
+    <>
+      <div className="inspector-title">{store.name}</div>
+      <div className="inspector-sub">{store.engine}{apps.length ? ` · ${apps.map(appName).join(', ')}` : ''}</div>
+      {store.url
+        ? <button className="link-btn mono" onClick={() => store.configRange && onPickRange(store.configRange)} disabled={!store.configRange} title={store.configRange ? `${store.configRange.file}:${store.configRange.startLine}` : undefined}>{store.url}</button>
+        : <p className="inspector-sub">Адрес не найден ни в конфигурации, ни в коде: все обращения этого вида показаны как одно хранилище.</p>}
+      {store.tables.length > 0 && <h3 className="inspector-h">Таблицы · {store.tables.length}</h3>}
+      <ul className="inspector-list">
+        {store.tables.map((t) => {
+          const uses = byTable.get(t.name) ?? [];
+          const writes = uses.filter((a) => a.op === 'write').length;
+          return (
+            <li key={t.name}>
+              <span>
+                <b className="mono">{t.name}</b>
+                <span className="muted">{t.entity ? `@${t.entity} · ` : ''}{uses.length ? `обращений ${uses.length}${writes ? `, записей ${writes}` : ''}` : 'обращений в коде нет'}</span>
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      {access.length > 0 && <h3 className="inspector-h">Где в коде · {access.length}</h3>}
+      <ul className="inspector-list">
+        {access.slice(0, 40).map((a, i) => (
+          <li key={i}>
+            <button onClick={() => onPickRange(a.range)} title="Показать в коде">
+              <span className="dep-call">{a.detail}</span>
+              <span className="muted">{a.type} · {a.op === 'write' ? 'запись' : a.op === 'read' ? 'чтение' : 'обращение'}</span>
+            </button>
+          </li>
+        ))}
+        {access.length > 40 && <li className="muted">…ещё {access.length - 40}</li>}
+      </ul>
+    </>
   );
 }

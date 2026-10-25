@@ -81,7 +81,7 @@ export function CodeEditor({ path, value, diagnostics, highlight, onChange, onCu
     if (!monaco || !model) return;
     monaco.editor.setModelMarkers(
       model,
-      'java-blueprints',
+      'dark-secrets',
       diagnostics
         .filter((d) => d.range.file === path)
         .map((d) => {

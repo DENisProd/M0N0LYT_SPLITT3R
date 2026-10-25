@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { MethodInfo, SourceFile, StubSpec, TypeInfo, UnitCase } from '../../shared/types.ts';
 import { analyzeProject } from './analyze.ts';
+import { chatJson } from './llm.ts';
 import { getSettings } from './store.ts';
 
 /*
@@ -352,25 +353,11 @@ async function llmCases(t: TypeInfo, m: MethodInfo, ctx: Ctx): Promise<UnitCase[
     '```',
   ].join('\n');
 
-  const { ollamaUrl, ollamaModel, llmTimeoutMs } = await getSettings();
-  const res = await fetch(`${ollamaUrl}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(llmTimeoutMs),
-    body: JSON.stringify({
-      model: ollamaModel,
-      stream: false,
-      format: SCHEMA,
-      options: { temperature: 0.2 },
-      messages: [
-        { role: 'system', content: 'Ты опытный Java-разработчик и пишешь тест-кейсы. Отвечай только JSON по схеме.' },
-        { role: 'user', content: prompt },
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`Ollama ${res.status}: ${(await res.text()).slice(0, 300)}`);
-  const body = (await res.json()) as { message?: { content?: string } };
-  const parsed = JSON.parse(body.message?.content ?? '{}') as { cases?: { name?: string; args?: unknown[]; stubs?: Partial<StubSpec>[] }[] };
+  const parsed = await chatJson<{ cases?: { name?: string; args?: unknown[]; stubs?: Partial<StubSpec>[] }[] }>(
+    'Ты опытный Java-разработчик и пишешь тест-кейсы. Отвечай только JSON по схеме.',
+    prompt,
+    SCHEMA,
+  );
   const depByName = new Map(deps.map((d) => [d.name, d]));
   const out: UnitCase[] = [];
   for (const c of parsed.cases ?? []) {

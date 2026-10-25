@@ -1,6 +1,7 @@
 import { useState, type CSSProperties } from 'react';
-import { ArrowRight, CircleCheck, Info, OctagonAlert, TriangleAlert, type LucideIcon } from 'lucide-react';
-import type { AnalyzeResult, Diagnostic, ScopeCategory, ScopeFinding, Severity } from '../../../shared/types.ts';
+import { ArrowRight, BookOpen, Bot, CircleCheck, Info, Lightbulb, LoaderCircle, OctagonAlert, PanelRightClose, Puzzle, Scissors, TriangleAlert, Wand, type LucideIcon } from 'lucide-react';
+import { fixSourceOf, type AnalyzeResult, type Diagnostic, type PatternFinding, type PatternId, type ScopeCategory, type ScopeFinding, type Severity } from '../../../shared/types.ts';
+import { PATTERNS, type PatternHelp } from '../patterns.ts';
 import { SCOPE, SEVERITY } from '../theme.ts';
 
 const ORDER: Record<Severity, number> = { high: 0, medium: 1, low: 2 };
@@ -35,11 +36,116 @@ function groupScope(findings: ScopeFinding[]): ScopeGroup[] {
 }
 
 interface Props {
+  hidden: boolean;
+  onHide: () => void;
   analysis: AnalyzeResult | null;
   selectedMethodId: string | null;
   selectedDiagnosticId: string | null;
   onPick: (d: Diagnostic) => void;
   onPickScope: (f: ScopeFinding) => void;
+  /** Предложить исправления: ids — конкретные проблемы, без них — все исправимые. */
+  onFix: (ids: string[] | undefined, llm: boolean) => void;
+  /** Проблемы, которые сейчас исправляются: 'all' — все исправимые, null — генерация не идёт. */
+  fixingIds: string[] | 'all' | null;
+  canFix: boolean;
+  llmDefault: boolean;
+  onPickPattern: (f: PatternFinding) => void;
+  /** Применить паттерн через LLM (с проверкой и ревью). */
+  onApplyPattern: (f: PatternFinding) => void;
+  onSplit: (f: PatternFinding) => void;
+  /** Находка, которая сейчас применяется. */
+  applyingPatternId: string | null;
+}
+
+function Help({ help }: { help: PatternHelp }) {
+  return (
+    <div className="pattern-help">
+      <p>{help.intent}</p>
+      <b>Когда уместен</b>
+      <ul>{help.when.map((w, i) => <li key={i}>{w}</li>)}</ul>
+      <b>Когда не нужен</b>
+      <p>{help.avoid}</p>
+      <div className="pattern-code">
+        <span className="muted">До</span>
+        <pre className="mono">{help.before}</pre>
+        <span className="muted">После</span>
+        <pre className="mono">{help.after}</pre>
+      </div>
+    </div>
+  );
+}
+
+function PatternCard({ f, selected, onPick, onApply, onSplit, applying, disabled }: {
+  f: PatternFinding; selected: boolean; onPick: () => void; onApply: () => void; onSplit: () => void; applying: boolean; disabled: boolean;
+}) {
+  const help = PATTERNS[f.pattern];
+  const found = f.kind === 'found';
+  return (
+    <div className={`diag pattern${selected ? ' is-selected' : ''}${applying ? ' is-fixing' : ''}${found ? ' is-found' : ' is-opportunity'}`}>
+      <span className="diag-icon">{found ? <Puzzle size={15} strokeWidth={2.25} aria-label="Найден" /> : <Lightbulb size={15} strokeWidth={2.25} aria-label="Можно применить" />}</span>
+      <span className="diag-body">
+        <span className="diag-head">
+          <button className="diag-open" onClick={onPick}><b>{f.title}</b></button>
+          <span className="diag-loc mono">{f.range.file}:{f.range.startLine}</span>
+        </span>
+        <span className="diag-msg">{f.message}</span>
+        {f.warning && <span className="pattern-warn"><TriangleAlert size={13} /> {f.warning}</span>}
+        {f.roles.length > 0 && (
+          <span className="pattern-roles">
+            {f.roles.map((r, i) => <span key={i} className="pattern-role"><span className="muted">{r.role}</span> <span className="mono">{r.name}</span></span>)}
+          </span>
+        )}
+        <details className="pattern-more">
+          <summary><BookOpen size={12} /> {help.name} · {help.family.toLowerCase()}{found ? '' : ' — как применить'}</summary>
+          <Help help={help} />
+        </details>
+        {f.action && (
+          <span className="diag-actions">
+            {f.action === 'split' ? (
+              <button className="btn small" disabled={disabled} onClick={onSplit} title="Подобрать состав новых классов и разделить"><Scissors size={13} /> Разделить класс</button>
+            ) : (
+              <button className="btn small" disabled={disabled} onClick={onApply} title="Локальная LLM перепишет код; ответ проверяется компиляцией и тестами, затем — ревью">
+                {applying ? <><LoaderCircle size={13} className="spin" /> Применяется…</> : <><Bot size={13} /> {f.warning ? 'Исправить' : 'Применить'}</>}
+              </button>
+            )}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function PatternsTab({ findings, onPick, onApply, onSplit, applyingId, canApply }: {
+  findings: PatternFinding[]; onPick: (f: PatternFinding) => void; onApply: (f: PatternFinding) => void; onSplit: (f: PatternFinding) => void; applyingId: string | null; canApply: boolean;
+}) {
+  const [picked, setPicked] = useState<string | null>(null);
+  const found = findings.filter((f) => f.kind === 'found');
+  const chances = findings.filter((f) => f.kind === 'opportunity');
+  const card = (f: PatternFinding) => (
+    <PatternCard
+      key={f.id} f={f} selected={f.id === picked} applying={f.id === applyingId}
+      disabled={!canApply || applyingId !== null}
+      onPick={() => { setPicked(f.id); onPick(f); }} onApply={() => onApply(f)} onSplit={() => onSplit(f)}
+    />
+  );
+  return (
+    <div className="scroll diag-list">
+      {chances.length > 0 && <h3 className="pattern-group">Можно применить <span className="count">{chances.length}</span></h3>}
+      {chances.map(card)}
+      {found.length > 0 && <h3 className="pattern-group">Уже в коде <span className="count">{found.length}</span></h3>}
+      {found.map(card)}
+      {!findings.length && <p className="panel-empty">Паттернов и мест для них не найдено.</p>}
+      <details className="pattern-catalog">
+        <summary><BookOpen size={13} /> Справочник паттернов</summary>
+        {(Object.keys(PATTERNS) as PatternId[]).map((id) => (
+          <details key={id} className="pattern-more">
+            <summary>{PATTERNS[id].name} <span className="muted">· {PATTERNS[id].family.toLowerCase()}</span></summary>
+            <Help help={PATTERNS[id]} />
+          </details>
+        ))}
+      </details>
+    </div>
+  );
 }
 
 function Complexity({ from, to }: { from: string; to?: string }) {
@@ -56,8 +162,11 @@ function Complexity({ from, to }: { from: string; to?: string }) {
   );
 }
 
-export function AnalysisPanel({ analysis, selectedMethodId, selectedDiagnosticId, onPick, onPickScope }: Props) {
-  const [tab, setTab] = useState<'problems' | 'metrics'>('problems');
+export function AnalysisPanel({ hidden, onHide, analysis, selectedMethodId, selectedDiagnosticId, onPick, onPickScope, onFix, fixingIds, canFix, llmDefault, onPickPattern, onApplyPattern, onSplit, applyingPatternId }: Props) {
+  const [tab, setTab] = useState<'problems' | 'patterns' | 'metrics'>('problems');
+  const patterns = analysis?.patterns ?? [];
+  const chances = patterns.filter((p) => p.kind === 'opportunity').length;
+  const [llm, setLlm] = useState(llmDefault);
   const diagnostics = [...(analysis?.diagnostics ?? [])].sort((a, b) => ORDER[a.severity] - ORDER[b.severity]);
   const metrics = analysis?.metrics ?? [];
   const current = metrics.find((m) => m.methodId === selectedMethodId);
@@ -66,12 +175,20 @@ export function AnalysisPanel({ analysis, selectedMethodId, selectedDiagnosticId
   const counts = { high: 0, medium: 0, low: scope.length };
   for (const d of diagnostics) counts[d.severity]++;
   const total = diagnostics.length + scope.length;
+  const fixing = fixingIds !== null;
+  const fixable = diagnostics.filter((d) => {
+    const src = fixSourceOf(d);
+    return src === 'rule' || (src === 'llm' && llm);
+  });
 
   return (
-    <section className="panel analysis" aria-label="Анализ">
+    <section className="panel analysis" aria-label="Анализ" hidden={hidden}>
       <div className="tabs" role="tablist">
         <button role="tab" aria-selected={tab === 'problems'} onClick={() => setTab('problems')}>
           Проблемы <span className="count">{total}</span>
+        </button>
+        <button role="tab" aria-selected={tab === 'patterns'} onClick={() => setTab('patterns')} title="Паттерны проектирования: найденные и где помогут">
+          Паттерны {chances > 0 && <span className="count is-warn">{chances}</span>}
         </button>
         <button role="tab" aria-selected={tab === 'metrics'} onClick={() => setTab('metrics')}>
           Метрики
@@ -85,6 +202,9 @@ export function AnalysisPanel({ analysis, selectedMethodId, selectedDiagnosticId
             ))}
           </span>
         )}
+        <button className="icon-btn neutral panel-hide" onClick={onHide} aria-label="Скрыть панель" title="Скрыть панель">
+          <PanelRightClose size={15} />
+        </button>
       </div>
 
       {analysis?.parseErrors.length ? (
@@ -98,7 +218,20 @@ export function AnalysisPanel({ analysis, selectedMethodId, selectedDiagnosticId
         </div>
       ) : null}
 
-      {tab === 'problems' ? (
+      {tab === 'problems' && diagnostics.length > 0 && (
+        <div className="fix-bar">
+          <button className="btn" disabled={!canFix || fixing || !fixable.length} onClick={() => onFix(undefined, llm)} title="Предложить исправления: ничего не применится без вашего подтверждения">
+            {fixingIds === 'all' ? <><LoaderCircle size={14} className="spin" /> Генерация…</> : <><Wand size={14} /> Исправить всё ({fixable.length})</>}
+          </button>
+          <label className="check" title="Переписывать методы через локальную LLM там, где нет точного правила (длинные методы, вложенные циклы, N+1)">
+            <input type="checkbox" checked={llm} onChange={(e) => setLlm(e.target.checked)} /> LLM
+          </label>
+        </div>
+      )}
+
+      {tab === 'patterns' ? (
+        <PatternsTab findings={patterns} onPick={onPickPattern} onApply={onApplyPattern} onSplit={onSplit} applyingId={applyingPatternId} canApply={canFix && fixingIds === null} />
+      ) : tab === 'problems' ? (
         <div className="scroll diag-list">
           {!analysis && <p className="panel-empty">Здесь появятся найденные дефекты, оценка сложности и способы исправления.</p>}
           {analysis && total === 0 && (
@@ -108,24 +241,38 @@ export function AnalysisPanel({ analysis, selectedMethodId, selectedDiagnosticId
           )}
           {diagnostics.map((d) => {
             const Icon = ICON[d.severity];
+            const source = fixSourceOf(d);
+            const inProgress = fixingIds === 'all' ? fixable.includes(d) : !!fixingIds?.includes(d.id);
             return (
-              <button
+              // Карточка — не кнопка: внутри неё своя кнопка «Исправить». Клик по карточке ведёт заголовок (растянут на всю карточку).
+              <div
                 key={d.id}
-                className={`diag${d.id === selectedDiagnosticId ? ' is-selected' : ''}`}
+                className={`diag${d.id === selectedDiagnosticId ? ' is-selected' : ''}${inProgress ? ' is-fixing' : ''}`}
                 style={{ '--sev': SEVERITY[d.severity].color } as CSSProperties}
-                onClick={() => onPick(d)}
               >
                 <span className="diag-icon"><Icon size={15} strokeWidth={2.25} aria-label={SEVERITY[d.severity].label} /></span>
                 <span className="diag-body">
                   <span className="diag-head">
-                    <b>{d.title}</b>
+                    <button className="diag-open" onClick={() => onPick(d)}><b>{d.title}</b></button>
                     <span className="diag-loc mono">{d.range.file}:{d.range.startLine}</span>
                   </span>
                   <span className="diag-msg">{d.message}</span>
                   <span className="diag-rec">{d.recommendation}</span>
                   {d.complexity && <Complexity from={d.complexity} to={d.improvedComplexity} />}
+                  {source && (
+                    <span className="diag-actions">
+                      <button
+                        className="btn small"
+                        disabled={!canFix || fixing || (source === 'llm' && !llm)}
+                        onClick={() => onFix([d.id], llm)}
+                        title={source === 'rule' ? 'Точная замена по правилу; если шаблон не подойдёт — через LLM' : llm ? 'Метод перепишет локальная LLM' : 'Нужна LLM: включите переключатель «LLM» выше'}
+                      >
+                        {inProgress ? <><LoaderCircle size={13} className="spin" /> Исправляется…</> : <>{source === 'rule' ? <Wand size={13} /> : <Bot size={13} />} Исправить</>}
+                      </button>
+                    </span>
+                  )}
                 </span>
-              </button>
+              </div>
             );
           })}
           {scope.map((g) => {

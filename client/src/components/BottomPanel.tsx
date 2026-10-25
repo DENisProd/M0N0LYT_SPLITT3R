@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react';
-import { CircleCheck, CircleX, Plus, TriangleAlert, X } from 'lucide-react';
+import { CircleCheck, CircleX, PanelBottomClose, Plus, TriangleAlert, X } from 'lucide-react';
 import type { CompareResult, TestCase } from '../../../shared/types.ts';
 import { SCOPE } from '../theme.ts';
 import { UnitDiff } from './CasesPanel.tsx';
@@ -10,9 +10,11 @@ export interface LogLine {
   kind?: 'ok' | 'error';
 }
 
-export type BottomTab = 'console' | 'tests' | 'cases' | 'results';
+export type BottomTab = 'console' | 'tests' | 'cases' | 'results' | 'history';
 
 interface Props {
+  hidden: boolean;
+  onHide: () => void;
   tab: BottomTab;
   onTabChange: (tab: BottomTab) => void;
   logs: LogLine[];
@@ -23,11 +25,14 @@ interface Props {
   /** Вкладка тест-кейсов классов (CasesPanel) и их число. */
   casesPanel: ReactNode;
   casesCount: number;
+  /** Вкладка версий (HistoryPanel) и число незафиксированных файлов. */
+  historyPanel: ReactNode;
+  changes: number;
 }
 
 const ms = (v: number) => `${Math.round(v)} мс`;
 
-export function BottomPanel({ tab, onTabChange, logs, tests, onTestsChange, compare, hasBaseline, casesPanel, casesCount }: Props) {
+export function BottomPanel({ hidden, onHide, tab, onTabChange, logs, tests, onTestsChange, compare, hasBaseline, casesPanel, casesCount, historyPanel, changes }: Props) {
   const consoleEnd = useRef<HTMLDivElement>(null);
   const update = (i: number, patch: Partial<TestCase>) => onTestsChange(tests.map((t, j) => (j === i ? { ...t, ...patch } : t)));
   const compiled = !!compare && compare.originalCompile.ok && compare.modifiedCompile.ok;
@@ -43,7 +48,7 @@ export function BottomPanel({ tab, onTabChange, logs, tests, onTestsChange, comp
   }, [logs, tab]);
 
   return (
-    <section className="panel bottom" aria-label="Запуск и тесты">
+    <section className="panel bottom" aria-label="Запуск и тесты" hidden={hidden}>
       <div className="tabs" role="tablist">
         <button role="tab" aria-selected={tab === 'console'} onClick={() => onTabChange('console')}>Консоль</button>
         <button role="tab" aria-selected={tab === 'tests'} onClick={() => onTabChange('tests')}>
@@ -59,6 +64,12 @@ export function BottomPanel({ tab, onTabChange, logs, tests, onTestsChange, comp
               {compileOnly ? 'сборка' : `${compare.passed}/${compare.total}`}
             </span>
           )}
+        </button>
+        <button role="tab" aria-selected={tab === 'history'} onClick={() => onTabChange('history')}>
+          Версии {changes > 0 && <span className="count is-warn" title="Незафиксированных файлов">{changes}</span>}
+        </button>
+        <button className="icon-btn neutral panel-hide" onClick={onHide} aria-label="Скрыть панель" title="Скрыть панель">
+          <PanelBottomClose size={15} />
         </button>
       </div>
 
@@ -76,6 +87,8 @@ export function BottomPanel({ tab, onTabChange, logs, tests, onTestsChange, comp
       )}
 
       {tab === 'cases' && casesPanel}
+
+      {tab === 'history' && historyPanel}
 
       {tab === 'tests' && (
         <div className="scroll tests">

@@ -447,7 +447,7 @@ export function buildArchitecture(files: SourceFile[], trees: Tree[], types: Typ
     if (target) link(imp.app, target.app, 'library', { detail: `import ${imp.qualified}`, ...imp.call, toType: target.type });
   }
 
-  return { apps, externals: [...externals.values()], links: [...links.values()] };
+  return { apps, externals: [...externals.values()], links: [...links.values()], stores: [], access: [] };
 }
 
 /** Вызов по имени допустим внутри приложения и в общую библиотеку — не в чужую JVM. */

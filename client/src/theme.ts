@@ -78,6 +78,7 @@ export const LINK: Record<LinkKind, { title: string; color: string }> = {
   http: { title: 'HTTP', color: k(220, 0.12) },
   messaging: { title: 'Сообщения', color: k(150, 0.12) },
   library: { title: 'Общий код', color: 'oklch(0.62 0.02 255)' },
+  data: { title: 'Данные', color: k(300, 0.12) },
 };
 
 export const EDGE_COLOR = {
