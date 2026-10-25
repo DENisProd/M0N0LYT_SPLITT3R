@@ -53,6 +53,26 @@ function isInsideLoop(n: Node, stopAt: Node): boolean {
   return loopDepth(n, stopAt) > 0;
 }
 
+const loopVar = (f: Node) => f.childForFieldName('init')?.descendantsOfType('identifier')[0]?.text;
+
+/**
+ * Заполнение матрицы: for i, внутри независимый for j, в теле — запись в a[i][j] (или a[j][i]).
+ * Каждая клетка результата заполняется один раз, это O(размер результата), ускорять нечего.
+ */
+function isGridFill(outer: Node, inner: Node[]): boolean {
+  if (inner.length !== 1 || outer.type !== 'for_statement' || inner[0].type !== 'for_statement') return false;
+  const i = loopVar(outer), j = loopVar(inner[0]);
+  if (!i || !j) return false;
+  if (inner[0].childForFieldName('condition')?.descendantsOfType('identifier').some((n) => n?.text === i)) return false;
+  return descendants(inner[0], 'assignment_expression').some((a) => {
+    const left = a.childForFieldName('left');
+    const row = left?.type === 'array_access' ? left.childForFieldName('array') : null;
+    // a[i][j] или, при транспонировании, a[j][i].
+    const cell = row?.type === 'array_access' ? `${row.childForFieldName('index')?.text},${left!.childForFieldName('index')?.text}` : '';
+    return cell === `${i},${j}` || cell === `${j},${i}`;
+  });
+}
+
 /** Имя переменной → объявленный тип (параметры, локальные переменные, поля класса). */
 export function declaredTypes(m: MethodNode, type: TypeInfo | undefined): Map<string, string> {
   const map = new Map<string, string>();
@@ -105,7 +125,9 @@ export function analyze(methods: MethodNode[], types: TypeInfo[]): { diagnostics
       if (depth < 2) continue;
       const withStreams = [outer, ...inner].some((u) => u.type === 'method_invocation');
       const hasEquals = descendants(outer, 'method_invocation').some((c) => c.childForFieldName('name')?.text === 'equals')
-        || descendants(outer, 'binary_expression').some((b) => b.children.some((c) => c?.type === '=='));
+        // Сравнение с константой (rest % k == 0) — проверка условия, а не поиск совпадения элементов.
+        || descendants(outer, 'binary_expression').some((b) => b.children.some((c) => c?.type === '==') && !b.namedChildren.some((c) => c?.type.endsWith('literal')));
+      if (depth === 2 && !hasEquals && isGridFill(outer, inner)) continue;
       report({
         rule: 'nested-loops',
         severity: depth >= 3 ? 'high' : 'medium',

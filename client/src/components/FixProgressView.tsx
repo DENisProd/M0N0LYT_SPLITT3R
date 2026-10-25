@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Bot, CircleCheck, CircleX, LoaderCircle, RotateCcw, Square, Wand } from 'lucide-react';
+import { CircleCheck, CircleX, LoaderCircle, RotateCcw, Square } from 'lucide-react';
 import type { FixProgress } from '../../../shared/types.ts';
 
 export interface FixRun {
@@ -44,9 +44,9 @@ interface MethodRow {
 }
 
 const STAGE: Partial<Record<FixProgress['step'], string>> = {
-  generate: 'LLM пишет код',
-  compile: 'Компиляция',
-  behavior: 'Компиляция и прогон тестов',
+  generate: 'генерация',
+  compile: 'компиляция',
+  behavior: 'компиляция и тесты',
 };
 
 function fold(events: FixRun['events']) {
@@ -64,75 +64,71 @@ function fold(events: FixRun['events']) {
   return { rows: [...rows.values()], total };
 }
 
+const plural = (n: number, one: string, few: string, many: string) =>
+  `${n} ${n % 10 === 1 && n % 100 !== 11 ? one : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20) ? few : many}`;
+
 interface Props {
   run: FixRun;
   onCancel: () => void;
 }
 
 export function FixProgressView({ run, onCancel }: Props) {
-  const steps = run.events.map((e) => e.p.step);
   const last = run.events.at(-1);
   const { rows, total } = fold(run.events);
-  const building = last?.p.step === 'build';
-  const llmStarted = rows.length > 0;
   const queued = Math.max(0, total - rows.length);
+  // До первого метода идёт подготовка: правила, затем сборка проекта для проверки ответов.
+  const prep = rows.length ? null : last?.p.step === 'build' ? 'Сборка проекта' : run.patternId ? 'Подготовка' : 'Исправления по правилам';
+  const scope = run.patternId ? null : run.ids ? plural(run.ids.length, 'проблема', 'проблемы', 'проблем') : 'все исправимые проблемы';
 
   return (
-    <div className="fix-progress" aria-live="polite">
+    <div className="fix-progress" aria-live="polite" aria-busy="true">
       <div className="fix-progress-bar" aria-hidden="true" />
       <div className="fix-progress-head">
-        <span className="fix-progress-icon">{run.llm ? <Bot size={18} /> : <Wand size={18} />}</span>
-        <div className="fix-progress-title">
-          <b>{run.title ?? (run.llm ? 'Генерация исправлений' : 'Поиск исправлений')}</b>
-          <span className="muted">
-            {run.patternId ? 'Паттерн проектирования' : run.ids ? `Проблем: ${run.ids.length}` : 'Все исправимые проблемы'} · <Elapsed since={run.started} />
-          </span>
-        </div>
-        <button className="btn" onClick={onCancel}><Square size={13} /> Отменить</button>
+        <h2 className="fix-progress-title">
+          {run.title ?? (run.llm ? 'Исправление' : 'Поиск исправлений')}
+          {scope && <span className="muted"> · {scope}</span>}
+        </h2>
+        <Elapsed since={run.started} />
+        <button className="btn" onClick={onCancel}><Square size={12} /> Отменить</button>
       </div>
 
       <ol className="fix-steps">
-        <li className={steps.length > 1 ? 'is-done' : 'is-active'}>
-          {steps.length > 1 ? <CircleCheck size={15} /> : <LoaderCircle size={15} className="spin" />}
-          <span>{run.patternId ? 'Подготовка' : 'Точные исправления по правилам'}</span>
-        </li>
-        {run.llm && (steps.includes('build') || llmStarted) && (
-          <li className={llmStarted ? 'is-done' : 'is-active'}>
-            {llmStarted ? <CircleCheck size={15} /> : <LoaderCircle size={15} className="spin" />}
-            <span>Сборка проекта до правок — чтобы проверять ответы LLM</span>
-            {building && <Elapsed since={last!.at} />}
+        {prep && (
+          <li className="is-active">
+            <LoaderCircle size={14} className="spin" />
+            <span className="fix-step-name">{prep}</span>
+            {last && <Elapsed since={last.at} />}
           </li>
         )}
         {rows.map((r) => {
           const done = r.step === 'method-done';
           return (
             <li key={r.method} className={done ? (r.ok ? 'is-done' : 'is-failed') : 'is-active'}>
-              {done ? r.ok ? <CircleCheck size={15} /> : <CircleX size={15} /> : <LoaderCircle size={15} className="spin" />}
-              <div className="fix-step-body">
-                <div className="fix-step-line">
-                  <span className="mono ellipsis">{r.method}</span>
-                  {r.total > 1 && <span className="muted">{r.index} из {r.total}</span>}
+              {done ? r.ok ? <CircleCheck size={14} /> : <CircleX size={14} /> : <LoaderCircle size={14} className="spin" />}
+              <span className="fix-step-name mono ellipsis" title={r.method}>{r.method}</span>
+              {!done && (
+                <span className="fix-step-stage">
+                  {STAGE[r.step]}{r.maxAttempts > 1 && `, попытка ${r.attempt}/${r.maxAttempts}`}
+                </span>
+              )}
+              {!done && r.total > 1 && <span className="fix-step-count">{r.index}/{r.total}</span>}
+              {!done && <Elapsed since={r.since} />}
+              {(r.retries.length > 0 || (done && r.detail)) && (
+                <div className="fix-step-body">
+                  {r.retries.map((reason, i) => (
+                    <div key={i} className="fix-step-retry"><RotateCcw size={11} /> {i + 1}: {reason}</div>
+                  ))}
+                  {done && r.detail && <div className="fix-step-note">{r.detail}</div>}
                 </div>
-                {!done && (
-                  <div className="fix-step-stage">
-                    {STAGE[r.step]} · попытка {r.attempt} из {r.maxAttempts} · <Elapsed since={r.since} />
-                  </div>
-                )}
-                {r.retries.map((reason, i) => (
-                  <div key={i} className="fix-step-retry"><RotateCcw size={12} /> Попытка {i + 1}: {reason}</div>
-                ))}
-                {done && r.detail && <div className="fix-step-note">{r.detail}</div>}
-              </div>
+              )}
             </li>
           );
         })}
-        {queued > 0 && <li className="is-queued"><span className="fix-dot" /> <span>В очереди методов: {queued}</span></li>}
+        {queued > 0 && <li className="is-queued"><span className="fix-dot" /> <span className="fix-step-name">ещё {plural(queued, 'метод', 'метода', 'методов')} в очереди</span></li>}
       </ol>
 
-      <p className="hint fix-progress-hint">
-        {run.llm
-          ? 'Одна попытка локальной модели — от 30 секунд до нескольких минут. Ответ проверяется компиляцией и тестами; если не прошёл, ошибки уходят модели. Без вашего подтверждения ничего не применится.'
-          : 'Без вашего подтверждения ничего не применится.'}
+      <p className="fix-progress-hint">
+        {run.llm ? 'Попытка модели занимает от 30 секунд до нескольких минут. ' : ''}Изменения откроются в ревью и без подтверждения не применятся.
       </p>
     </div>
   );

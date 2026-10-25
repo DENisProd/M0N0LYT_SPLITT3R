@@ -92,7 +92,13 @@ export function ClassView({ analysis, files = null, focusType = null, onOpenMeth
       methods.map((m) => ({ id: m.id, ...methodBox(m) })),
       calls.map((e) => ({ id: `${e.from}->${e.to}`, source: e.from, target: e.to })),
       'RIGHT',
-    ).then((pos) => !cancelled && setLayout({ key: layoutKey, pos }));
+    )
+      .then((pos) => !cancelled && setLayout({ key: layoutKey, pos }))
+      .catch((e) => {
+        // Раскладка не удалась — показываем методы сеткой, а не пустой холст.
+        console.error('Раскладка графа классов:', e);
+        if (!cancelled) setLayout({ key: layoutKey, pos: new Map(methods.map((m, i) => [m.id, { x: (i % 6) * 480, y: Math.floor(i / 6) * 120 }])) });
+      });
     return () => {
       cancelled = true;
     };

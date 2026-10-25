@@ -18,6 +18,8 @@ import { chatJson } from './llm.ts';
 import { collectErrors, descendants, parseJava } from './parser.ts';
 import { diffText } from '../../shared/diff.ts';
 import { checkJava, compareBehavior, Workspace } from './runner.ts';
+import { counterLines, onlyCounters, type CounterLine } from './counters.ts';
+import { paramTypes } from './model.ts';
 import { pipelineOf } from './streams.ts';
 
 /*
@@ -350,7 +352,7 @@ export interface Attempt {
   errors: string;
 }
 
-async function llmRewrite(method: MethodInfo, src: string, problems: Diagnostic[], classHeader: string, previous: Attempt | null, signal?: AbortSignal): Promise<string> {
+async function llmRewrite(method: MethodInfo, src: string, problems: Diagnostic[], classHeader: string, siblings: MethodInfo[], previous: Attempt | null, signal?: AbortSignal): Promise<string> {
   const code = src.slice(method.range.start, method.range.end);
   const prompt = [
     `Исправь дефекты в методе ${method.signature} класса ${method.className}.`,
@@ -362,9 +364,13 @@ async function llmRewrite(method: MethodInfo, src: string, problems: Diagnostic[
     '- Поведение не меняется: тот же результат, тот же вывод в stdout/stderr в том же порядке, те же исключения для тех же входов.',
     '- Сигнатура, модификаторы и аннотации метода остаются прежними.',
     '- Можно добавить private-методы (static, если исходный метод static): верни их в code после исправленного метода.',
+    '  Остальные методы класса уже есть — вызывай их, но не объявляй заново и не возвращай в code; новым методам дай имена, которых нет в списке.',
     '- Новый метод видит только свои параметры и поля класса. Каждую локальную переменную исходного метода, которая ему нужна, передай параметром;',
     '  если новый метод меняет такую переменную (счётчик, флаг), верни новое значение результатом и присвой его в исходном методе.',
-    '- Новых import нет: классы JDK, которых нет в коде, пиши полным именем (java.util.HashMap).',
+    '- Классы JDK пиши коротким именем (Set, HashSet, Collectors): недостающие import добавятся сами. Сам import в code не пиши.',
+    '- Порядок действий с побочным эффектом не меняется: вызовы генератора случайных чисел, вывод, запись в поля и коллекции — в том же порядке.',
+    '  Перестановка циклов, обход HashSet/HashMap вместо списка меняют порядок — так нельзя.',
+    '- Поля-счётчики шагов (steps++) можно увеличивать реже: их значения при ускорении изменятся, это допустимо.',
     '- Java 17. Сохрани отступы и стиль исходного кода, комментарии оставь.',
     '- code — только Java-код метода (и новых методов), без ``` и пояснений. summary — что изменено, одной фразой по-русски.',
     '',
@@ -373,6 +379,7 @@ async function llmRewrite(method: MethodInfo, src: string, problems: Diagnostic[
     classHeader.slice(0, 3000),
     '```',
     '',
+    ...(siblings.length ? ['Другие методы класса (уже объявлены):', ...siblings.map((x) => `- ${x.isStatic ? 'static ' : ''}${x.returnType ?? ''} ${x.signature}`), ''] : []),
     'Метод:',
     '```java',
     code,
@@ -387,15 +394,41 @@ async function llmRewrite(method: MethodInfo, src: string, problems: Diagnostic[
           'Ошибки:',
           previous.errors.slice(0, MAX_ERRORS_TEXT),
           '',
-          'Верни исправленный вариант, в котором этих ошибок нет.',
+          'Верни исправленный вариант, в котором этих ошибок нет. Тот же код ещё раз не подойдёт: найди, какая правка дала расхождение, и измени подход.',
         ]
       : []),
   ].join('\n');
   const r = await chatJson<{ code?: string }>('Ты опытный Java-разработчик и делаешь рефакторинг без изменения поведения. Отвечай только JSON по схеме.', prompt, LLM_SCHEMA, signal);
-  const out = (r.code ?? '').replace(/^\s*```(?:java)?\s*\n?|\n?```\s*$/g, '').trimEnd();
+  const out = withoutRedeclared((r.code ?? '').replace(/^\s*```(?:java)?\s*\n?|\n?```\s*$/g, '').trimEnd(), siblings);
   if (!out.trim()) throw new Error('пустой ответ');
   if (!out.includes(method.name)) throw new Error(`в ответе нет метода ${method.name}`);
   return reindent(out, lineIndent(src, method.range.start));
+}
+
+/**
+ * Модель повторяет в ответе методы, которые в классе уже есть, — javac отвергает такой ответ.
+ * Копия с той же сигнатурой отбрасывается: остаётся метод из класса.
+ */
+function withoutRedeclared(code: string, siblings: MethodInfo[]): string {
+  const taken = new Set(siblings.map((m) => m.signature));
+  const prefix = 'class __Answer {\n';
+  const tree = parseJava(prefix + code + '\n}');
+  try {
+    const members = tree.rootNode.descendantsOfType('class_body')[0]?.namedChildren ?? [];
+    const cuts: [number, number][] = [];
+    for (const n of members) {
+      if (n?.type !== 'method_declaration' || !taken.has(`${n.childForFieldName('name')?.text}(${paramTypes(n).join(', ')})`)) continue;
+      // Вместе с javadoc/комментарием прямо над методом.
+      let first: Node = n;
+      while (first.previousNamedSibling?.type.endsWith('comment') && first.previousNamedSibling.endPosition.row >= first.startPosition.row - 1) first = first.previousNamedSibling;
+      cuts.push([first.startIndex - prefix.length, n.endIndex - prefix.length]);
+    }
+    let out = code;
+    for (const [from, to] of cuts.reverse()) out = out.slice(0, from) + out.slice(to);
+    return out.replace(/\n[ \t]*\n(?:[ \t]*\n)+/g, '\n\n').trimEnd();
+  } finally {
+    tree.delete();
+  }
 }
 
 /**
@@ -417,21 +450,60 @@ export function reindent(code: string, indent: string): string {
   return lines.map((l, i) => (!l.trim() ? '' : i ? indent + shift(l) : l.trimStart())).join('\n');
 }
 
-/** Расхождения поведения текстом для модели: вход теста и построчная разница вывода. */
-function behaviorErrors(r: CompareResult): string | null {
-  const out: string[] = [];
+/**
+ * Расхождения поведения текстом для модели: вход теста и построчная разница вывода.
+ * Строки, где разошлись только счётчики шагов, расхождением не считаются — их и меняет ускорение.
+ * Одинаковые расхождения разных тестов сводятся в одно.
+ */
+function behaviorErrors(r: CompareResult, counters: CounterLine[]): { errors: string | null; counters: string[] } {
+  const byText = new Map<string, string[]>();
+  const changed = new Set<string>();
   for (const c of r.cases.filter((x) => !x.passed && !x.flaky)) {
-    out.push(`Тест «${c.name}» — расходится ${c.mismatches.join(', ')}.`);
+    const out: string[] = [];
     for (const stream of ['stdout', 'stderr'] as const) {
-      const lines = diffText(stream, c.original[stream], c.modified[stream]).flatMap((h) => [...h.removed.map((l) => `- ${l}`), ...h.added.map((l) => `+ ${l}`)]);
+      const lines: string[] = [];
+      for (const h of diffText(stream, c.original[stream], c.modified[stream])) {
+        const only = h.removed.length === h.added.length ? h.removed.map((l, i) => onlyCounters(l, h.added[i], counters)) : [];
+        if (only.length && only.every(Boolean)) {
+          only.forEach((names) => names!.forEach((n) => changed.add(n)));
+          continue;
+        }
+        lines.push(...h.removed.map((l) => `- ${l}`), ...h.added.map((l) => `+ ${l}`));
+      }
       if (lines.length) out.push(`${stream} (- ожидалось, + получено):`, ...lines.slice(0, 20));
     }
     if (c.original.exitCode !== c.modified.exitCode) out.push(`код выхода: ожидался ${c.original.exitCode}, получен ${c.modified.exitCode}`);
+    if (c.modified.timedOut && !c.original.timedOut) out.push('программа не завершилась за отведённое время: этот вариант работает медленнее исходного');
+    if (!out.length) continue;
+    const key = out.join('\n');
+    byText.set(key, [...(byText.get(key) ?? []), c.name]);
   }
+  const out = [...byText].map(([text, names]) => `${names.length > 1 ? 'Тесты' : 'Тест'} ${names.map((n) => `«${n}»`).join(', ')} — вывод расходится.\n${text}`);
   for (const u of r.units.filter((x) => !x.passed && !x.flaky)) {
     out.push(`Тест-кейс «${u.name}» (${u.label}): ожидалось ${u.original.kind} ${u.original.value}, получено ${u.modified.kind} ${u.modified.value}.`);
   }
-  return out.length ? out.join('\n') : null;
+  return { errors: out.length ? out.join('\n') : null, counters: [...changed] };
+}
+
+/** Классы JDK, которые модель пишет коротким именем: import для них добавляется сам. */
+const JDK_CLASSES: Record<string, string> = Object.fromEntries([
+  ...['List', 'ArrayList', 'LinkedList', 'Map', 'HashMap', 'LinkedHashMap', 'TreeMap', 'Set', 'HashSet', 'LinkedHashSet', 'TreeSet',
+    'Deque', 'ArrayDeque', 'Queue', 'PriorityQueue', 'Arrays', 'Collections', 'Objects', 'Optional', 'Iterator', 'Comparator',
+    'BitSet', 'StringJoiner', 'NoSuchElementException'].map((c) => [c, `java.util.${c}`]),
+  ...['Collectors', 'Stream', 'IntStream', 'LongStream'].map((c) => [c, `java.util.stream.${c}`]),
+  ...['Function', 'BiFunction', 'Predicate', 'Supplier', 'Consumer', 'IntFunction', 'ToIntFunction'].map((c) => [c, `java.util.function.${c}`]),
+]);
+
+/** Текст файла с недостающими import по ошибкам javac «cannot find symbol: class X»; null — добавить нечего. */
+export function withMissingImports(text: string, errors: string): string | null {
+  const missing = [...new Set([...errors.matchAll(/symbol:\s+class (\w+)/g)].map((m) => m[1]))]
+    .filter((c) => JDK_CLASSES[c] && !new RegExp(`^import\\s+${JDK_CLASSES[c].replace(/\./g, '\\.')};`, 'm').test(text));
+  if (!missing.length) return null;
+  const lines = missing.map((c) => `import ${JDK_CLASSES[c]};`).join('\n');
+  const anchor = [...text.matchAll(/^import\s+[\w.*]+;[ \t]*$/gm)].pop() ?? text.match(/^package\s+[\w.]+;[ \t]*$/m);
+  if (!anchor) return `${lines}\n${text}`;
+  const at = anchor.index! + anchor[0].length;
+  return `${text.slice(0, at)}\n${lines}${text.slice(at)}`;
 }
 
 /** Ошибки сборки проекта или null, если собирается. */
@@ -474,6 +546,20 @@ export async function verifiedRewrite(opts: {
 }): Promise<{ ok: true; text: string; note: string } | { ok: false; reason: string }> {
   const { src, verify, progress, signal } = opts;
   const checksBehavior = verify.tests.length + verify.unitCases.length > 0;
+  const counters = checksBehavior ? counterLines(opts.before) : [];
+  /** Сборка и сравнение поведения текста файла: ошибки для модели или число пройденных тестов. */
+  const check = async (text: string): Promise<{ errors: string | null; kind: '' | 'compile' | 'behavior'; verified: number; counters: string[] }> => {
+    const candidate = opts.withFile(text);
+    if (!checksBehavior) {
+      const errors = await compileErrors(candidate);
+      return { errors, kind: errors ? 'compile' : '', verified: 0, counters: [] };
+    }
+    // Сравнение с версией до этой правки: так видно влияние именно ответа LLM.
+    const r = await compareBehavior(opts.before, candidate, verify.tests, undefined, verify.unitCases);
+    if (!r.modifiedCompile.ok) return { errors: r.modifiedCompile.errors.trim() || 'сборка не прошла', kind: 'compile', verified: 0, counters: [] };
+    const b = behaviorErrors(r, counters);
+    return { errors: b.errors, kind: b.errors ? 'behavior' : '', verified: b.errors ? 0 : r.total, counters: b.counters };
+  };
   let previous: Attempt | null = null;
   let failure = '';
   let attempts = 0;
@@ -481,29 +567,31 @@ export async function verifiedRewrite(opts: {
     attempts = attempt;
     try {
       progress({ step: 'generate', attempt, detail: attempt > 1 ? failure : undefined });
-      const { text: next, answer } = await opts.generate(previous);
+      const generated = await opts.generate(previous);
+      let next = generated.text;
+      const { answer } = generated;
       const tree = parseJava(next);
       const parseErrors = collectErrors(tree.rootNode);
       tree.delete();
       let errors = parseErrors.length > parseErrorCount(src) ? parseErrors.map((e) => `строка ${e.line}: ${e.message}`).join('\n') : null;
       let kind = errors ? 'parse' : '';
       let verified = 0;
+      let changedCounters: string[] = [];
       if (!errors && verify.compiles) {
-        const candidate = opts.withFile(next);
         progress({ step: checksBehavior ? 'behavior' : 'compile', attempt });
-        if (checksBehavior) {
-          // Сравнение с версией до этой правки: так видно влияние именно ответа LLM.
-          const r = await compareBehavior(opts.before, candidate, verify.tests, undefined, verify.unitCases);
-          errors = r.modifiedCompile.ok ? behaviorErrors(r) : r.modifiedCompile.errors.trim() || 'сборка не прошла';
-          kind = !errors ? '' : r.modifiedCompile.ok ? 'behavior' : 'compile';
-          if (!errors) verified = r.total;
-        } else {
-          errors = await compileErrors(candidate);
-          kind = errors ? 'compile' : '';
+        let r = await check(next);
+        // Модель пишет Set или Collectors без import — их добавляем сами, попытку на это не тратим.
+        const imported = r.kind === 'compile' ? withMissingImports(next, r.errors!) : null;
+        if (imported) {
+          next = imported;
+          r = await check(next);
         }
+        ({ errors, kind, verified } = r);
+        changedCounters = r.counters;
       }
       if (errors) {
         console.warn(`LLM: ${opts.label}, попытка ${attempt}: ${errors.split('\n')[0]}`);
+        if (process.env.LLM_DEBUG) console.warn(`--- ответ:\n${answer}\n--- ошибки:\n${errors}`);
         previous = { code: answer, errors };
         failure = kind === 'parse' ? 'ответ не разбирается как Java'
           : kind === 'behavior' ? `поведение изменилось: ${errors.split('\n')[0]}`
@@ -514,14 +602,19 @@ export async function verifiedRewrite(opts: {
       const note = !verify.compiles
         ? 'Переписано LLM. Компиляцию проверить не удалось (нет JDK или проект не собирается и без правок): проверьте сборку и поведение.'
         : verified
-          ? `Переписано LLM${tries}: проект компилируется, поведение совпало на ${verified} тест(ах). Тесты покрывают не всё — просмотрите правку.`
+          ? `Переписано LLM${tries}: проект компилируется, поведение совпало на ${verified} тест(ах)${changedCounters.length ? `; разошлись только счётчики шагов (${changedCounters.join(', ')}) — это ожидаемо при смене алгоритма` : ''}. Тесты покрывают не всё — просмотрите правку.`
           : `Переписано LLM${tries}: проект компилируется, но тестов, на которых можно сравнить поведение, нет — проверьте его вручную.`;
       progress({ step: 'method-done', attempt, ok: true, detail: note });
       return { ok: true, text: next, note };
     } catch (e) {
       if (signal?.aborted) throw e;
-      // Сбой связи или пустой ответ — повтор не поможет.
-      failure = e instanceof TypeError && e.message === 'fetch failed' ? 'Ollama недоступна — проверьте адрес в настройках' : `LLM: ${e instanceof Error ? e.message : e}`;
+      const message = e instanceof Error ? e.message : String(e);
+      // Модель зациклилась на повторе токенов — следующая попытка обычно проходит. Сбой связи или пустой ответ повтор не исправит.
+      if (/token repeat limit/.test(message)) {
+        failure = 'модель зациклилась, ответ оборван';
+        continue;
+      }
+      failure = e instanceof TypeError && message === 'fetch failed' ? 'Ollama недоступна — проверьте адрес в настройках' : `LLM: ${message}`;
       break;
     }
   }
@@ -635,7 +728,8 @@ export async function proposeFixes(req: FixRequest, { onProgress = () => {}, sig
         before: current(),
         withFile: (text) => current().map((f) => (f.path === m.range.file ? { ...f, content: text } : f)),
         generate: async (previous) => {
-          const code = await llmRewrite(m, src, diags, header, previous, signal);
+          const siblings = (type?.methods ?? []).filter((x) => x.id !== m.id && x.kind !== 'lambda');
+          const code = await llmRewrite(m, src, diags, header, siblings, previous, signal);
           return { text: src.slice(0, m.range.start) + code + src.slice(m.range.end), answer: code };
         },
         verify,

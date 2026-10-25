@@ -1,6 +1,6 @@
 import { useState, type CSSProperties } from 'react';
 import { ArrowRight, BookOpen, Bot, CircleCheck, Info, Lightbulb, LoaderCircle, OctagonAlert, PanelRightClose, Puzzle, Scissors, TriangleAlert, Wand, type LucideIcon } from 'lucide-react';
-import { fixSourceOf, type AnalyzeResult, type Diagnostic, type PatternFinding, type PatternId, type ScopeCategory, type ScopeFinding, type Severity } from '../../../shared/types.ts';
+import { fixSourceOf, type AnalyzeResult, type Diagnostic, type PatternFinding, type PatternId, type Range, type ScopeCategory, type ScopeFinding, type Severity } from '../../../shared/types.ts';
 import { PATTERNS, type PatternHelp } from '../patterns.ts';
 import { SCOPE, SEVERITY } from '../theme.ts';
 
@@ -35,11 +35,19 @@ function groupScope(findings: ScopeFinding[]): ScopeGroup[] {
   return [...groups.values()];
 }
 
+/** Метод или класс, до которого сужен список проблем. */
+export interface ProblemFocus {
+  label: string;
+  kind: 'method' | 'class';
+  test: (r: Range) => boolean;
+}
+
 interface Props {
   hidden: boolean;
   onHide: () => void;
   analysis: AnalyzeResult | null;
   selectedMethodId: string | null;
+  focus: ProblemFocus | null;
   selectedDiagnosticId: string | null;
   onPick: (d: Diagnostic) => void;
   onPickScope: (f: ScopeFinding) => void;
@@ -162,19 +170,25 @@ function Complexity({ from, to }: { from: string; to?: string }) {
   );
 }
 
-export function AnalysisPanel({ hidden, onHide, analysis, selectedMethodId, selectedDiagnosticId, onPick, onPickScope, onFix, fixingIds, canFix, llmDefault, onPickPattern, onApplyPattern, onSplit, applyingPatternId }: Props) {
+export function AnalysisPanel({ hidden, onHide, analysis, selectedMethodId, focus, selectedDiagnosticId, onPick, onPickScope, onFix, fixingIds, canFix, llmDefault, onPickPattern, onApplyPattern, onSplit, applyingPatternId }: Props) {
   const [tab, setTab] = useState<'problems' | 'patterns' | 'metrics'>('problems');
   const patterns = analysis?.patterns ?? [];
   const chances = patterns.filter((p) => p.kind === 'opportunity').length;
   const [llm, setLlm] = useState(llmDefault);
-  const diagnostics = [...(analysis?.diagnostics ?? [])].sort((a, b) => ORDER[a.severity] - ORDER[b.severity]);
+  // «Все» запоминается для конкретного метода/класса: выбрали другой — снова только его проблемы.
+  const [allFor, setAllFor] = useState<string | null>(null);
+  const filter = focus && allFor !== focus.label ? focus : null;
+  const allDiagnostics = analysis?.diagnostics ?? [];
+  const allScope = analysis?.scope ?? [];
+  const diagnostics = allDiagnostics.filter((d) => !filter || filter.test(d.range)).sort((a, b) => ORDER[a.severity] - ORDER[b.severity]);
   const metrics = analysis?.metrics ?? [];
   const current = metrics.find((m) => m.methodId === selectedMethodId);
   const improved = diagnostics.find((d) => d.methodId === selectedMethodId && d.improvedComplexity);
-  const scope = groupScope(analysis?.scope ?? []);
+  const scope = groupScope(allScope.filter((f) => !filter || filter.test(f.range)));
   const counts = { high: 0, medium: 0, low: scope.length };
   for (const d of diagnostics) counts[d.severity]++;
   const total = diagnostics.length + scope.length;
+  const projectTotal = allDiagnostics.length + groupScope(allScope).length;
   const fixing = fixingIds !== null;
   const fixable = diagnostics.filter((d) => {
     const src = fixSourceOf(d);
@@ -218,10 +232,29 @@ export function AnalysisPanel({ hidden, onHide, analysis, selectedMethodId, sele
         </div>
       ) : null}
 
+      {tab === 'problems' && focus && analysis && (
+        <div className="problem-focus">
+          {filter ? (
+            <>
+              <span className="ellipsis">
+                <span className="muted">{focus.kind === 'method' ? 'Метод' : 'Класс'}</span> <span className="mono">{focus.label}</span>
+                <span className="muted"> · {total} из {projectTotal}</span>
+              </span>
+              <button className="link-btn" onClick={() => setAllFor(focus.label)}>Все</button>
+            </>
+          ) : (
+            <>
+              <span className="muted">Весь проект</span>
+              <button className="link-btn ellipsis" onClick={() => setAllFor(null)}>Только <span className="mono">{focus.label}</span></button>
+            </>
+          )}
+        </div>
+      )}
+
       {tab === 'problems' && diagnostics.length > 0 && (
         <div className="fix-bar">
-          <button className="btn" disabled={!canFix || fixing || !fixable.length} onClick={() => onFix(undefined, llm)} title="Предложить исправления: ничего не применится без вашего подтверждения">
-            {fixingIds === 'all' ? <><LoaderCircle size={14} className="spin" /> Генерация…</> : <><Wand size={14} /> Исправить всё ({fixable.length})</>}
+          <button className="btn" disabled={!canFix || fixing || !fixable.length} onClick={() => onFix(filter ? fixable.map((d) => d.id) : undefined, llm)} title="Предложить исправления: ничего не применится без вашего подтверждения">
+            {fixingIds === 'all' ? <><LoaderCircle size={14} className="spin" /> Генерация…</> : <><Wand size={14} /> {filter ? `Исправить в ${filter.kind === 'method' ? 'методе' : 'классе'}` : 'Исправить всё'} ({fixable.length})</>}
           </button>
           <label className="check" title="Переписывать методы через локальную LLM там, где нет точного правила (длинные методы, вложенные циклы, N+1)">
             <input type="checkbox" checked={llm} onChange={(e) => setLlm(e.target.checked)} /> LLM
@@ -236,7 +269,7 @@ export function AnalysisPanel({ hidden, onHide, analysis, selectedMethodId, sele
           {!analysis && <p className="panel-empty">Здесь появятся найденные дефекты, оценка сложности и способы исправления.</p>}
           {analysis && total === 0 && (
             <p className="panel-empty ok">
-              <CircleCheck size={16} /> Дефектов не найдено
+              <CircleCheck size={16} /> {filter ? `В ${filter.kind === 'method' ? 'методе' : 'классе'} дефектов не найдено` : 'Дефектов не найдено'}
             </p>
           )}
           {diagnostics.map((d) => {

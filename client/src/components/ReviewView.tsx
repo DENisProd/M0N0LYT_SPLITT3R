@@ -15,6 +15,8 @@ export interface Review {
   base: SourceFile[];
   next: SourceFile[];
   fix?: FixResult;
+  /** К чему откатываются отклонённые фрагменты в режиме changes: «HEAD» по умолчанию, «эталону». */
+  baseLabel?: string;
   /** Правка цельная (разделение класса, паттерн): часть фрагментов без остальных не скомпилируется — только всё или ничего. */
   atomic?: boolean;
 }
@@ -190,7 +192,7 @@ export function ReviewView({ review, outdated, onApply, onCommit, onClose, onLoc
           <span className="muted review-hint">
             {review.mode === 'fix'
               ? `Принятые фрагменты лягут в рабочую копию приложения — файлы на диске не меняются${undecided ? `; без решения — ${undecided}, они не применятся` : ''}.`
-              : `Отклонённые фрагменты откатятся к HEAD${undecided ? `; без решения — ${undecided}, они останутся` : ''}.`}
+              : `Отклонённые фрагменты откатятся к ${review.baseLabel ?? 'HEAD'}${undecided ? `; без решения — ${undecided}, они останутся` : ''}.`}
           </span>
           {review.mode === 'changes' && (
             <input className="commit-input" value={message} onChange={(e) => setMessage(e.target.value)} placeholder="Описание версии" aria-label="Описание версии" />

@@ -54,7 +54,7 @@ import { exportProject } from './exportZip.ts';
 import { BLOCKS, deleteRange, insertAfter, insertAtBodyStart, replaceRange } from './edits.ts';
 import { changedFiles } from '../../shared/diff.ts';
 import { KIND } from './theme.ts';
-import { AnalysisPanel } from './components/AnalysisPanel.tsx';
+import { AnalysisPanel, type ProblemFocus } from './components/AnalysisPanel.tsx';
 import { AppsView } from './components/AppsView.tsx';
 import { BoundaryView, typeKey } from './components/BoundaryView.tsx';
 import { BottomPanel, type BottomTab, type LogLine } from './components/BottomPanel.tsx';
@@ -541,6 +541,19 @@ export function App() {
     return type ? { type } : null;
   }, [analysis, rootMethod, view, focusType]);
 
+  // Список проблем сужается до открытого метода (с его лямбдами) или выбранного класса.
+  const problemFocus = useMemo((): ProblemFocus | null => {
+    if (!casesTarget) return null;
+    const { type, method: m } = casesTarget;
+    if (m) return { label: m.signature, kind: 'method', test: (r) => r.file === m.range.file && m.range.start <= r.start && r.end <= m.range.end };
+    const members = [...type.methods.map((x) => x.range), ...type.fields.map((f) => f.range)].filter((r) => r.file === type.file);
+    if (!members.length) return null;
+    const start = Math.min(...members.map((r) => r.start));
+    const end = Math.max(...members.map((r) => r.end));
+    // Для класса — пересечение: проблемы уровня класса (диапазон шире членов) тоже его.
+    return { label: type.name, kind: 'class', test: (r) => r.file === type.file && r.start <= end && start <= r.end };
+  }, [casesTarget]);
+
   const fieldsOf = useCallback((c: UnitCase) => {
     const t = analysis?.types.find((x) => x.binaryName === c.binaryName && x.file === c.file);
     const plain = /^(int|long|short|byte|double|float|boolean|char|String|Integer|Long|Short|Byte|Double|Float|Boolean|Character)$/;
@@ -578,6 +591,12 @@ export function App() {
     if (view !== 'review') viewBeforeReview.current = view;
     setReview({ ...r, id: Date.now() });
     setView('review');
+  };
+  /** Что изменилось после эталона: diff текущего кода с версией, с которой сравнивается поведение. */
+  const showChanges = () => {
+    if (!baseline) return;
+    if (!changedFiles(baseline.files, files)) return log('Изменений после эталона нет', 'ok');
+    openReview({ mode: 'changes', title: 'Изменения после эталона', base: baseline.files, next: files, baseLabel: 'эталону' });
   };
   const closeReview = () => {
     setReview(null);
@@ -693,7 +712,7 @@ export function App() {
         viewBeforeReview.current = 'classes';
       }
     } else if (review.mode === 'fix') log(`Применено фрагментов: ${accepted}, отклонено: ${rejected} — в рабочей копии приложения, исходные файлы на диске не изменены. Проверьте поведение, зафиксируйте версию и скачайте исправленный вариант кнопкой «Экспорт копии».`, 'ok');
-    else log(`Откачено к HEAD фрагментов: ${rejected}`, 'ok');
+    else log(`Откачено к ${review.baseLabel ?? 'HEAD'} фрагментов: ${rejected}`, 'ok');
     closeReview();
   };
 
@@ -897,12 +916,17 @@ export function App() {
             <span className="dot" />
             {java.state === 'checking' ? 'Проверка JDK' : javaReady ? java.version : java.state === 'offline' ? 'Сервер недоступен' : 'JDK не найден'}
           </span>
-          {baseline && (
-            <span className={`status ${dirty ? 'is-warn' : ''}`}>
+          {baseline && (dirty ? (
+            <button className="status is-warn is-link" onClick={() => showChanges()} title="Показать, что изменилось после эталона">
               <span className="dot" />
-              {dirty ? 'Код изменён после эталона' : `Эталон от ${baseline.at}`}
+              Код изменён после эталона
+            </button>
+          ) : (
+            <span className="status">
+              <span className="dot" />
+              Эталон от {baseline.at}
             </span>
-          )}
+          ))}
           {verdict && (
             <span className={`status is-${verdict}`}>
               {verdict === 'ok' ? <CircleCheck size={13} /> : verdict === 'warn' ? <TriangleAlert size={13} /> : <CircleX size={13} />}
@@ -1137,6 +1161,7 @@ export function App() {
         onHide={() => setShowAnalysis(false)}
         analysis={analysis}
         selectedMethodId={view === 'flow' ? methodId : null}
+        focus={problemFocus}
         selectedDiagnosticId={selectedDiagnosticId}
         onPick={pickDiagnostic}
         onPickScope={pickScope}
@@ -1165,7 +1190,9 @@ export function App() {
           <>
             <div className="code-bar mono">
               <FileCode size={13} /> {activeFile.path}
-              {dirty && <span className="code-dirty">изменён</span>}
+              {baseline && baseline.files.find((f) => f.path === activeFile.path)?.content !== activeFile.content && (
+                <button className="code-dirty" onClick={() => showChanges()} title="Показать изменения после эталона">изменён</button>
+              )}
             </div>
             <div className="code-body">
               <CodeEditor

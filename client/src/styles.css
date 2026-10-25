@@ -285,7 +285,10 @@ body.is-resizing { cursor: row-resize; user-select: none; }
 .code { grid-area: code; display: flex; flex-direction: column; }
 .code-bar { display: flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--fg-2); font-size: 12px; }
 .code-bar svg { color: var(--fg-3); }
-.code-dirty { margin-left: 4px; padding: 1px 7px; border-radius: 9px; font-family: var(--font); font-size: 11px; color: var(--warn); background: var(--warn-soft); }
+.code-dirty { margin-left: 4px; padding: 1px 7px; border: none; border-radius: 9px; font-family: var(--font); font-size: 11px; color: var(--warn); background: var(--warn-soft); cursor: pointer; }
+.code-dirty:hover { background: color-mix(in oklch, var(--warn) 24%, transparent); }
+.status.is-link { border: none; font: inherit; cursor: pointer; }
+.status.is-link:hover { background: color-mix(in oklch, var(--warn) 24%, transparent); }
 .code-body { flex: 1; min-height: 0; }
 .code-highlight { background: var(--accent-soft); border-radius: 2px; }
 
@@ -701,13 +704,16 @@ pre.out.is-bad { color: var(--bad); }
 .seg button:hover { color: var(--fg); }
 .seg button[aria-selected='true'] { background: var(--bg-2); color: var(--fg); }
 .seg .count.is-bad { color: var(--bad); }
-.bottleneck { border-left: 3px solid var(--sev); cursor: pointer; }
+.bottleneck { cursor: pointer; }
+.bottleneck .diag-loc { color: var(--sev); font-weight: 600; }
 .link-btn { align-self: flex-start; display: inline-flex; align-items: center; gap: 4px; padding: 0; border: none; background: none; color: var(--accent); font: inherit; font-size: 12px; cursor: pointer; }
 .link-btn:hover { text-decoration: underline; }
 .type-node.is-focus { box-shadow: 0 0 0 2px var(--accent); }
 .type-node.is-dim { opacity: 0.3; }
 
 /* ---------- Автоисправление ---------- */
+.problem-focus { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 10px 0; font-size: 12px; flex: none; min-width: 0; }
+.problem-focus .link-btn { align-self: auto; flex: none; max-width: 60%; display: inline-block; }
 .fix-bar { display: flex; align-items: center; gap: 8px; padding: 10px 10px 0; flex: none; }
 .diag { position: relative; cursor: default; }
 /* Заголовок — кнопка, растянутая на всю карточку; «Исправить» лежит поверх неё. */
@@ -800,42 +806,37 @@ pre.out.is-bad { color: var(--bad); }
 .elapsed { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .diag.is-fixing { border-color: color-mix(in oklch, var(--accent) 55%, var(--line)); background: color-mix(in oklch, var(--accent) 6%, var(--bg-1)); }
 
-.fix-progress { position: relative; display: flex; flex-direction: column; gap: 16px; height: 100%; overflow: auto; padding: 22px 24px; background: var(--bg-1); }
-/* Неопределённый прогресс: длительность генерации заранее не известна, полоса показывает, что работа идёт. */
-.fix-progress-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; overflow: hidden; background: var(--accent-soft); }
-.fix-progress-bar::after { content: ''; position: absolute; inset: 0; width: 35%; background: var(--accent); animation: fix-slide 1.6s var(--ease) infinite; }
-@keyframes fix-slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
-.fix-progress-head { display: flex; align-items: center; gap: 12px; }
-.fix-progress-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: var(--r-lg); background: var(--accent-soft); color: var(--accent); flex: none; animation: fix-pulse 2s ease-in-out infinite; }
-@keyframes fix-pulse { 50% { box-shadow: 0 0 0 6px color-mix(in oklch, var(--accent) 10%, transparent); } }
-.fix-progress-title { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
-.fix-progress-title b { font-size: 15px; font-weight: 600; }
-.fix-progress-title .muted { font-size: 12.5px; }
-.fix-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-width: 760px; }
-.fix-steps > li { display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px; border-radius: var(--r-md); color: var(--fg-3); }
-.fix-steps > li > svg, .fix-steps .fix-dot { flex: none; margin-top: 1px; }
-.fix-steps > li > span:not(.elapsed) { flex: 1; }
-.fix-steps > li > .elapsed { color: var(--fg-3); font-size: 12px; }
-.fix-steps li.is-done { color: var(--fg-2); }
+.fix-progress { position: relative; display: flex; flex-direction: column; gap: 14px; height: 100%; overflow: auto; padding: 18px 24px; background: var(--bg-1); }
+/* Неопределённый прогресс: генерация не знает своей длительности. */
+.fix-progress-bar { position: absolute; top: 0; left: 0; right: 0; height: 2px; overflow: hidden; }
+.fix-progress-bar::after { content: ''; position: absolute; inset: 0; width: 30%; background: var(--accent); animation: fix-slide 1.6s var(--ease) infinite; }
+@keyframes fix-slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+.fix-progress-head { display: flex; align-items: center; gap: 12px; max-width: 760px; }
+.fix-progress-title { flex: 1; min-width: 0; margin: 0; font-size: 14px; font-weight: 600; }
+.fix-progress-title .muted { font-weight: 400; }
+.fix-progress-head > .elapsed { color: var(--fg-2); font-size: 13px; }
+.fix-steps { list-style: none; margin: 0; padding: 0; max-width: 760px; border-top: 1px solid var(--line); }
+.fix-steps > li { display: flex; flex-wrap: wrap; align-items: center; column-gap: 10px; row-gap: 4px; min-height: 36px; padding: 8px 0; border-bottom: 1px solid var(--line); color: var(--fg-2); }
+.fix-steps > li > svg, .fix-steps .fix-dot { flex: none; color: var(--fg-3); }
+.fix-steps li.is-active > svg { color: var(--accent); }
 .fix-steps li.is-done > svg { color: var(--ok); }
 .fix-steps li.is-failed > svg { color: var(--bad); }
-.fix-steps li.is-active { color: var(--fg); background: var(--bg-2); }
-.fix-steps li.is-active > svg { color: var(--accent); }
-.fix-dot { display: inline-block; width: 15px; height: 15px; border: 1.5px dashed var(--line-strong); border-radius: 50%; }
-.fix-step-body { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
-.fix-step-line { display: flex; align-items: baseline; gap: 8px; }
-.fix-step-line .mono { color: var(--fg); }
-.fix-step-line .muted { font-size: 12px; flex: none; }
-.fix-step-stage { color: var(--accent); font-size: 12.5px; }
+.fix-step-name { flex: 1; min-width: 0; color: var(--fg); }
+.fix-steps li.is-queued .fix-step-name { color: var(--fg-3); }
+.fix-step-stage, .fix-step-count { flex: none; font-size: 12px; color: var(--fg-2); }
+.fix-step-count { color: var(--fg-3); font-variant-numeric: tabular-nums; }
+.fix-steps > li > .elapsed { flex: none; min-width: 34px; text-align: right; color: var(--fg-3); font-size: 12px; }
+.fix-dot { display: inline-block; width: 14px; height: 14px; border: 1.5px dashed var(--line-strong); border-radius: 50%; }
+.fix-step-body { flex-basis: 100%; display: flex; flex-direction: column; gap: 3px; padding-left: 24px; }
 .fix-step-retry { display: flex; align-items: flex-start; gap: 6px; color: var(--warn); font-size: 12px; line-height: 1.45; }
-.fix-step-retry svg { flex: none; margin-top: 2px; }
+.fix-step-retry svg { flex: none; margin-top: 3px; }
 .fix-step-note { color: var(--fg-3); font-size: 12px; line-height: 1.45; }
 .fix-steps li.is-failed .fix-step-note { color: color-mix(in oklch, var(--bad) 70%, var(--fg-2)); }
-.fix-progress-hint { margin: 0; font-size: 12.5px; }
+.fix-progress-hint { margin: 0; max-width: 760px; color: var(--fg-3); font-size: 12px; }
 @media (prefers-reduced-motion: reduce) {
-  .fix-progress-bar::after, .fix-progress-icon { animation: none; }
-  .fix-progress-bar::after { width: 100%; opacity: 0.5; }
+  .fix-progress-bar::after { animation: none; width: 100%; opacity: 0.4; }
 }
+
 
 /* ---------- Разделение класса ---------- */
 .split-count { display: flex; align-items: center; gap: 4px; }

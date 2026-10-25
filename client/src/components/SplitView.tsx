@@ -77,7 +77,6 @@ export function SplitView({ target, files, tests, unitCases, onDone, onClose }: 
   return (
     <div className="review split">
       <div className="review-head">
-        <span className="fix-progress-icon"><Scissors size={17} /></span>
         <div className="review-title">
           <b>Разделение класса {target.typeName}</b>
           <span className="muted">

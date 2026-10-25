@@ -41,7 +41,7 @@ function paramsOf(decl: Node): { name: string; type: string }[] {
     });
 }
 
-const paramTypes = (decl: Node) => paramsOf(decl).map((p) => p.type);
+export const paramTypes = (decl: Node) => paramsOf(decl).map((p) => p.type);
 
 /** Тело типа: члены класса, включая члены после констант enum. */
 function members(body: Node): Node[] {
