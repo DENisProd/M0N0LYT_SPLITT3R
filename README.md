@@ -4,6 +4,7 @@
 методов, находит дефекты и оценивает сложность. Править код можно в графе или в редакторе. Исправления,
 разделение классов и применение паттернов проверяются компиляцией и сравнением поведения с эталоном.
 Исходные файлы на диске инструмент не меняет: результат скачивается отдельной копией.
+https://split.darksecrets.ru
 
 ## Запуск
 
@@ -81,6 +82,9 @@ pnpm -C server db:studio  # просмотр базы
 ### Граф и редактирование
 
 <img width="1034" height="714" alt="image" src="https://github.com/user-attachments/assets/39c3a9ee-34e6-46d0-a019-0fadf6d7737f" />
+<img width="1963" height="1084" alt="image" src="https://github.com/user-attachments/assets/ac2a60ea-f0ce-4522-bad5-c069ba7b70a3" />
+<img width="1936" height="1267" alt="image" src="https://github.com/user-attachments/assets/2e6aeac8-35fb-43be-bb36-73abf594c1c6" />
+
 
 Три уровня просмотра:
 - «Приложения» — сервисы проекта, связи между ними (HTTP, Feign, брокеры сообщений) и хранилища данных, в которые
@@ -238,6 +242,11 @@ pnpm -C server db:studio  # просмотр базы
 ### Микросервисы
 
 <img width="1470" height="790" alt="image" src="https://github.com/user-attachments/assets/e21551e3-3a33-410a-9d28-d3ba21a8f3d3" />
+Попытка разделения на микросервисы приложения https://github.com/DENisProd/Mini-Games
+<img width="2288" height="1204" alt="image" src="https://github.com/user-attachments/assets/abfca47b-5975-499c-b6f5-711beb09c955" />
+<img width="2043" height="838" alt="image" src="https://github.com/user-attachments/assets/eaec51c6-3308-4609-a829-e470ad068e1e" />
+<img width="2035" height="784" alt="image" src="https://github.com/user-attachments/assets/4c3080d9-8035-4054-b215-34f29fd8ef78" />
+
 
 Вкладка «Микросервисы» строит граф зависимостей классов. Веса связей: наследование и generic-аргументы — 4, поле — 3,
 вызов метода — 1, тип параметра или результата — 1. Роли классов (сущность, репозиторий, контроллер, слушатель,
